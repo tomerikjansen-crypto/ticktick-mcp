@@ -3,12 +3,17 @@ import json
 import base64
 import requests
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, List, Any, Optional, Tuple
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+# Delt tokenfil med dashboard-serverens Node-tokenmodul (prosjektering-repoet,
+# fase 2 K5): ett token-system paa tvers av Python og Node.
+TOKEN_FILE = Path.home() / ".ticktick" / "tokens.json"
 
 class TickTickClient:
     """
@@ -21,7 +26,14 @@ class TickTickClient:
         self.client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
         self.access_token = os.getenv("TICKTICK_ACCESS_TOKEN")
         self.refresh_token = os.getenv("TICKTICK_REFRESH_TOKEN")
-        
+
+        # Delt tokenfil (skrives av dashboard-serverens token-modul) har
+        # forrang over .env: ett token-system paa tvers av Node og Python (K5)
+        shared = self._read_token_file()
+        if shared:
+            self.access_token = shared.get("access_token") or self.access_token
+            self.refresh_token = shared.get("refresh_token") or self.refresh_token
+
         if not self.access_token:
             raise ValueError("TICKTICK_ACCESS_TOKEN environment variable is not set. "
                             "Please run 'uv run -m ticktick_mcp.authenticate' to set up your credentials.")
@@ -84,7 +96,10 @@ class TickTickClient:
             
             # Save the tokens to the .env file
             self._save_tokens_to_env(tokens)
-            
+
+            # Hold den delte tokenfila i synk slik at Node-serveren ser fornyelsen
+            self._write_token_file()
+
             logger.info("Access token refreshed successfully.")
             return True
             
@@ -128,7 +143,44 @@ class TickTickClient:
                 f.write(f"{key}={value}\n")
         
         logger.debug("Tokens saved to .env file")
-    
+
+    def _read_token_file(self) -> Optional[Dict]:
+        """Les den delte tokenfila. Returnerer None ved manglende/korrupt fil."""
+        try:
+            if TOKEN_FILE.exists():
+                data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+                if data.get("access_token"):
+                    return data
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not read shared token file: {e}")
+        return None
+
+    def _write_token_file(self) -> None:
+        """Skriv gjeldende tokens til den delte fila (atomisk via tmp+replace)."""
+        try:
+            TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "access_token": self.access_token,
+                "refresh_token": self.refresh_token,
+                "oppdatert": datetime.now(timezone.utc).isoformat(),
+                "kilde": "python-refresh",
+            }
+            tmp = TOKEN_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(TOKEN_FILE)
+        except OSError as e:
+            logger.warning(f"Could not write shared token file: {e}")
+
+    def _send(self, method: str, url: str, data=None):
+        """Send ett HTTP-kall med gjeldende headers."""
+        if method == "GET":
+            return requests.get(url, headers=self.headers)
+        elif method == "POST":
+            return requests.post(url, headers=self.headers, json=data)
+        elif method == "DELETE":
+            return requests.delete(url, headers=self.headers)
+        raise ValueError(f"Unsupported HTTP method: {method}")
+
     def _make_request(self, method: str, endpoint: str, data=None) -> Dict:
         """
         Makes a request to the TickTick API.
@@ -144,37 +196,31 @@ class TickTickClient:
         url = f"{self.base_url}{endpoint}"
         
         try:
-            # Make the request
-            if method == "GET":
-                response = requests.get(url, headers=self.headers)
-            elif method == "POST":
-                response = requests.post(url, headers=self.headers, json=data)
-            elif method == "DELETE":
-                response = requests.delete(url, headers=self.headers)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-            
-            # Check if the request was unauthorized (401)
+            response = self._send(method, url, data)
+
+            if response.status_code == 401:
+                # Node-serveren kan alt ha fornyet tokenet - les delt fil
+                # foer vi brenner vaar egen refresh (refresh_token roterer)
+                shared = self._read_token_file()
+                if shared and shared.get("access_token") and shared["access_token"] != self.access_token:
+                    logger.info("Using refreshed token from shared token file.")
+                    self.access_token = shared["access_token"]
+                    self.refresh_token = shared.get("refresh_token") or self.refresh_token
+                    self.headers["Authorization"] = f"Bearer {self.access_token}"
+                    response = self._send(method, url, data)
+
             if response.status_code == 401:
                 logger.info("Access token expired. Attempting to refresh...")
-                
-                # Try to refresh the access token
                 if self._refresh_access_token():
-                    # Retry the request with the new token
-                    if method == "GET":
-                        response = requests.get(url, headers=self.headers)
-                    elif method == "POST":
-                        response = requests.post(url, headers=self.headers, json=data)
-                    elif method == "DELETE":
-                        response = requests.delete(url, headers=self.headers)
-            
+                    response = self._send(method, url, data)
+
             # Raise an exception for 4xx/5xx status codes
             response.raise_for_status()
-            
+
             # Return empty dict for 204 No Content
             if response.status_code == 204 or response.text == "":
                 return {}
-            
+
             return response.json()
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed: {e}")
