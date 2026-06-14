@@ -37,7 +37,7 @@ def initialize_client():
         
         # Test API connectivity
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             logger.error(f"Failed to access TickTick API: {projects['error']}")
             logger.error("Your access token may have expired. Please run 'uv run -m ticktick_mcp.cli auth' to refresh it.")
             return False
@@ -121,16 +121,16 @@ async def get_projects() -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         if not projects:
             return "No projects found."
-        
+
         result = f"Found {len(projects)} projects:\n\n"
         for i, project in enumerate(projects, 1):
             result += f"Project {i}:\n" + format_project(project) + "\n"
-        
+
         return result
     except Exception as e:
         logger.error(f"Error in get_projects: {e}")
@@ -589,9 +589,9 @@ async def get_all_tasks() -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def all_tasks_filter(task: Dict[str, Any]) -> bool:
             return True  # Include all tasks
         
@@ -618,9 +618,9 @@ async def get_tasks_by_priority(priority_id: int) -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def priority_filter(task: Dict[str, Any]) -> bool:
             return task.get('priority', 0) == priority_id
         
@@ -640,9 +640,9 @@ async def get_tasks_due_today() -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def today_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_today(task)
         
@@ -661,9 +661,9 @@ async def get_overdue_tasks() -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def overdue_filter(task: Dict[str, Any]) -> bool:
             return _is_task_overdue(task)
         
@@ -675,23 +675,23 @@ async def get_overdue_tasks() -> str:
 
 @mcp.tool()
 async def get_tasks_due_tomorrow() -> str:
-    """Get all tasks from TickTick that are due today. Ignores closed projects."""
+    """Get all tasks from TickTick that are due tomorrow. Ignores closed projects."""
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
-    
+
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def today_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_in_days(task, 1)
-        
-        return _get_project_tasks_by_filter(projects, today_filter, "due today")
-        
+
+        return _get_project_tasks_by_filter(projects, today_filter, "due tomorrow")
+
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_today: {e}")
+        logger.error(f"Error in get_tasks_due_tomorrow: {e}")
         return f"Error retrieving projects: {str(e)}"
     
 @mcp.tool()
@@ -711,9 +711,9 @@ async def get_tasks_due_in_days(days: int) -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def days_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_in_days(task, days)
         
@@ -733,9 +733,9 @@ async def get_tasks_due_this_week() -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def week_filter(task: Dict[str, Any]) -> bool:
             due_date = task.get('dueDate')
             if not due_date:
@@ -772,9 +772,9 @@ async def search_tasks(search_term: str) -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def search_filter(task: Dict[str, Any]) -> bool:
             return _task_matches_search(task, search_term)
         
@@ -897,9 +897,9 @@ async def get_engaged_tasks() -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def engaged_filter(task: Dict[str, Any]) -> bool:
             is_high_priority = task.get('priority', 0) == 5
             is_overdue = _is_task_overdue(task)
@@ -924,9 +924,9 @@ async def get_next_tasks() -> str:
     
     try:
         projects = ticktick.get_projects()
-        if 'error' in projects:
+        if isinstance(projects, dict) and 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def next_filter(task: Dict[str, Any]) -> bool:
             is_medium_priority = task.get('priority', 0) == 3
             is_due_tomorrow = _is_task_due_in_days(task, 1)
