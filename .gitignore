@@ -16,6 +16,9 @@ env/
 
 # Environment variables (contains sensitive API keys)
 .env
+.mcp.json
+settings.local.json
+client_secret_*.json
 
 # IDE specific files
 .idea/
