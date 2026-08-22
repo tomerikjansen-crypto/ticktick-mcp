@@ -550,33 +550,37 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
     if not projects:
         return "No projects found."
     
-    result = f"Found {len(projects)} projects:\n\n"
-    
+    blocks = []
+    checked = 0
+
     for i, project in enumerate(projects, 1):
         if project.get('closed'):
             continue
-            
+        checked += 1
+
         project_id = project.get('id', 'No ID')
         project_data = ticktick.get_project_with_data(project_id)
         tasks = project_data.get('tasks', [])
-        
-        if not tasks:
-            result += f"Project {i}:\n{format_project(project)}"
-            result += f"With 0 tasks that are to be '{filter_name}' in this project :\n\n\n"
-            continue
-        
+
         # Filter tasks using the provided function
         filtered_tasks = [(t, task) for t, task in enumerate(tasks, 1) if filter_func(task)]
-        
-        result += f"Project {i}:\n{format_project(project)}"
-        result += f"With {len(filtered_tasks)} tasks that are to be '{filter_name}' in this project :\n"
-        
+
+        # Flagg 112: skip projects with no matching tasks so one real hit
+        # is not buried under dozens of empty "0 tasks" blocks.
+        if not filtered_tasks:
+            continue
+
+        block = f"Project {i}:\n{format_project(project)}"
+        block += f"With {len(filtered_tasks)} tasks that are to be '{filter_name}' in this project :\n"
         for t, task in filtered_tasks:
-            result += f"Task {t}:\n{format_task(task)}\n"
-        
-        result += "\n\n"
-    
-    return result
+            block += f"Task {t}:\n{format_task(task)}\n"
+        blocks.append(block)
+
+    if not blocks:
+        return f"0 tasks matching '{filter_name}' across {checked} projects."
+
+    result = f"Found matches in {len(blocks)} of {checked} projects:\n\n"
+    return result + "\n\n".join(blocks) + "\n"
 
 # New MCP Tools for Tasks
 
