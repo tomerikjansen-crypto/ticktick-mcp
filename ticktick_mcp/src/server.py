@@ -20,6 +20,12 @@ mcp = FastMCP("ticktick")
 # Create TickTick client
 ticktick = None
 
+# Max chars of a task description kept when a task is rendered as part of a LIST.
+# Lists routinely cover 40+ tasks, and descriptions dominate the payload: on the
+# "26000 - INTERNARBEID" list (61 tasks) they were 82.2 % of 71 632 chars, median
+# 879 and largest 2 750. Single-task views ignore this and show everything.
+KOMPAKT_CONTENT_GRENSE = 200
+
 def initialize_client():
     global ticktick
     try:
@@ -49,8 +55,21 @@ def initialize_client():
         return False
 
 # Format a task object from TickTick for better display
-def format_task(task: Dict) -> str:
-    """Format a task into a human-readable string."""
+def format_task(task: Dict, kompakt: bool = False) -> str:
+    """Format a task into a human-readable string.
+
+    Args:
+        task: The task dictionary from TickTick.
+        kompakt: Set True when the task is rendered as part of a LIST. Long
+            descriptions are truncated and subtask lists collapsed to a count,
+            so a large project does not blow the caller's token budget. Metadata
+            (id, title, dates, priority, status) is never truncated. Leave False
+            for single-task views - those callers lose nothing.
+
+    Measured on the "26000 - INTERNARBEID" list (61 tasks, 71 632 chars):
+    descriptions were 82.2 % of the output, metadata 16.5 %. Truncating at
+    KOMPAKT_CONTENT_GRENSE cuts the total by roughly two thirds.
+    """
     formatted = f"ID: {task.get('id', 'No ID')}\n"
     formatted += f"Title: {task.get('title', 'No title')}\n"
     
@@ -73,17 +92,32 @@ def format_task(task: Dict) -> str:
     formatted += f"Status: {status}\n"
     
     # Add content if available
-    if task.get('content'):
-        formatted += f"\nContent:\n{task.get('content')}\n"
-    
+    content = task.get('content')
+    if content:
+        if kompakt and len(content) > KOMPAKT_CONTENT_GRENSE:
+            formatted += (
+                f"\nContent (truncated, {len(content)} chars total - "
+                f"use get_task for the full text):\n"
+                f"{content[:KOMPAKT_CONTENT_GRENSE]}...\n"
+            )
+        else:
+            formatted += f"\nContent:\n{content}\n"
+
     # Add subtasks if available
     items = task.get('items', [])
     if items:
-        formatted += f"\nSubtasks ({len(items)}):\n"
-        for i, item in enumerate(items, 1):
-            status = "✓" if item.get('status') == 1 else "□"
-            formatted += f"{i}. [{status}] {item.get('title', 'No title')}\n"
-    
+        if kompakt:
+            done = sum(1 for item in items if item.get('status') == 1)
+            formatted += (
+                f"\nSubtasks: {len(items)} ({done} done) - "
+                f"use get_task for the list\n"
+            )
+        else:
+            formatted += f"\nSubtasks ({len(items)}):\n"
+            for i, item in enumerate(items, 1):
+                status = "✓" if item.get('status') == 1 else "□"
+                formatted += f"{i}. [{status}] {item.get('title', 'No title')}\n"
+
     return formatted
 
 # Format a project object from TickTick for better display
@@ -162,7 +196,10 @@ async def get_project(project_id: str) -> str:
 async def get_project_tasks(project_id: str) -> str:
     """
     Get all tasks in a specific project.
-    
+
+    Descriptions longer than 200 chars are TRUNCATED here and marked as such;
+    call get_task for a task's full text before drawing conclusions from it.
+
     Args:
         project_id: ID of the project
     """
@@ -181,7 +218,7 @@ async def get_project_tasks(project_id: str) -> str:
         
         result = f"Found {len(tasks)} tasks in project '{project_data.get('project', {}).get('name', project_id)}':\n\n"
         for i, task in enumerate(tasks, 1):
-            result += f"Task {i}:\n" + format_task(task) + "\n"
+            result += f"Task {i}:\n" + format_task(task, kompakt=True) + "\n"
         
         return result
     except Exception as e:
@@ -573,7 +610,7 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
         block = f"Project {i}:\n{format_project(project)}"
         block += f"With {len(filtered_tasks)} tasks that are to be '{filter_name}' in this project :\n"
         for t, task in filtered_tasks:
-            block += f"Task {t}:\n{format_task(task)}\n"
+            block += f"Task {t}:\n{format_task(task, kompakt=True)}\n"
         blocks.append(block)
 
     if not blocks:
@@ -586,7 +623,11 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
 
 @mcp.tool()
 async def get_all_tasks() -> str:
-    """Get all tasks from TickTick. Ignores closed projects."""
+    """Get all tasks from TickTick. Ignores closed projects.
+
+    Descriptions longer than 200 chars are TRUNCATED here and marked as such;
+    call get_task for a task's full text before drawing conclusions from it.
+    """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -609,6 +650,9 @@ async def get_all_tasks() -> str:
 async def get_tasks_by_priority(priority_id: int) -> str:
     """
     Get all tasks from TickTick by priority. Ignores closed projects.
+
+    Descriptions longer than 200 chars are TRUNCATED here and marked as such;
+    call get_task for a task's full text before drawing conclusions from it.
 
     Args:
         priority_id: Priority of tasks to retrieve {0: "None", 1: "Low", 3: "Medium", 5: "High"}
@@ -637,7 +681,11 @@ async def get_tasks_by_priority(priority_id: int) -> str:
 
 @mcp.tool()
 async def get_tasks_due_today() -> str:
-    """Get all tasks from TickTick that are due today. Ignores closed projects."""
+    """Get all tasks from TickTick that are due today. Ignores closed projects.
+
+    Descriptions longer than 200 chars are TRUNCATED here and marked as such;
+    call get_task for a task's full text before drawing conclusions from it.
+    """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -658,7 +706,11 @@ async def get_tasks_due_today() -> str:
 
 @mcp.tool()
 async def get_overdue_tasks() -> str:
-    """Get all overdue tasks from TickTick. Ignores closed projects."""
+    """Get all overdue tasks from TickTick. Ignores closed projects.
+
+    Descriptions longer than 200 chars are TRUNCATED here and marked as such;
+    call get_task for a task's full text before drawing conclusions from it.
+    """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -763,7 +815,11 @@ async def get_tasks_due_this_week() -> str:
 async def search_tasks(search_term: str) -> str:
     """
     Search for tasks in TickTick by title, content, or subtask titles. Ignores closed projects.
-    
+
+    The search runs against the FULL text, but descriptions longer than 200 chars
+    are TRUNCATED in the output and marked as such - so a match can sit past the
+    cut and be invisible here. Call get_task on a hit to see it in context.
+
     Args:
         search_term: Text to search for (case-insensitive)
     """
