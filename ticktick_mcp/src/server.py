@@ -55,7 +55,7 @@ def initialize_client():
         return False
 
 # Format a task object from TickTick for better display
-def format_task(task: Dict, kompakt: bool = False) -> str:
+def format_task(task: Dict, kompakt: bool = False, status_bekreftelse: Optional[str] = None) -> str:
     """Format a task into a human-readable string.
 
     Args:
@@ -65,6 +65,12 @@ def format_task(task: Dict, kompakt: bool = False) -> str:
             so a large project does not blow the caller's token budget. Metadata
             (id, title, dates, priority, status) is never truncated. Leave False
             for single-task views - those callers lose nothing.
+        status_bekreftelse: Kun relevant naar task['status'] != 2 (ikke fullført).
+            None betyr "ikke kryssjekket" (uendret oppførsel - vises som "Active").
+            "trolig_slettet" og "krysssjekk_feilet" kommer fra _verify_task_active
+            (GH-issue #385: enkeltoppslaget GET /project/{p}/task/{t} viser fortsatt
+            status 0 ("Active") for en oppgave som er slettet/i papirkurven - Open
+            API skiller ikke aktiv fra slettet der).
 
     Measured on the "26000 - INTERNARBEID" list (61 tasks, 71 632 chars):
     descriptions were 82.2 % of the output, metadata 16.5 %. Truncating at
@@ -88,7 +94,21 @@ def format_task(task: Dict, kompakt: bool = False) -> str:
     formatted += f"Priority: {priority_map.get(priority, str(priority))}\n"
     
     # Add status if available
-    status = "Completed" if task.get('status') == 2 else "Active"
+    if task.get('status') == 2:
+        status = "Completed"
+    elif status_bekreftelse == "trolig_slettet":
+        status = (
+            "Trolig slettet (papirkurv) - API-et rapporterer 'Active', men oppgaven "
+            "finnes ikke blant prosjektets uavsluttede oppgaver (GET .../data). "
+            "TickTicks Open API skiller ikke slettet fra aktiv i enkeltoppslag. Se GH-issue #385."
+        )
+    elif status_bekreftelse == "krysssjekk_feilet":
+        status = (
+            "Active (USIKKER - kryssjekk mot prosjektets oppgaveliste feilet, "
+            "kan ikke bekrefte at oppgaven faktisk er aktiv og ikke slettet)"
+        )
+    else:
+        status = "Active"
     formatted += f"Status: {status}\n"
     
     # Add content if available
@@ -143,6 +163,50 @@ def format_project(project: Dict) -> str:
         formatted += f"Kind: {project.get('kind')}\n"
     
     return formatted
+
+def _verify_task_active(project_id: str, task_id: str) -> str:
+    """Kryssjekker om en ikke-fullført oppgave faktisk er aktiv, eller trolig slettet.
+
+    GH-issue #385: GET /project/{p}/task/{t} (enkeltoppslag) viser status 0
+    ("Active") for en oppgave selv etter at den er slettet med
+    DELETE /project/{p}/task/{t} - Open API skiller ikke aktiv fra slettet der.
+    Bevist mekanisk 27.09.2026: en TEST-oppgave opprettet og deretter slettet
+    fortsatte å svare status 0 med identisk feltsett på enkeltoppslaget.
+
+    GET /project/{p}/data returnerer derimot kun "undone tasks under project"
+    (ticktick-openapi.md, ProjectData.tasks) - en slettet oppgave er fraværende
+    der. Denne funksjonen bruker DERFOR /data som fasit for om en "Active"-status
+    fra enkeltoppslaget kan stoles på.
+
+    Gjelder ogsaa Innboksen: dens prosjekt-id brukes urort mot samme /data-kall -
+    feiler kallet (ukjent id-format, nettverk, 401), returneres 'krysssjekk_feilet'
+    slik at kalleren ALDRI viser "Active" stille ved en feilet kryssjekk.
+
+    Returns:
+        "bekreftet" - oppgaven finnes blant prosjektets uavsluttede oppgaver.
+        "trolig_slettet" - oppgaven mangler der; API-ets 'Active' er upaalitelig.
+        "krysssjekk_feilet" - selve /data-kallet feilet; status er ukjent, IKKE aktiv.
+    """
+    try:
+        project_data = ticktick.get_project_with_data(project_id)
+    except Exception as e:
+        logger.warning(f"Kryssjekk mot prosjektdata feilet for task {task_id} (project {project_id}): {e}")
+        return "krysssjekk_feilet"
+
+    if not isinstance(project_data, dict) or 'error' in project_data:
+        logger.warning(f"Kryssjekk mot prosjektdata feilet for task {task_id} (project {project_id}): {project_data}")
+        return "krysssjekk_feilet"
+
+    # Et svar UTEN tasks-liste (HTTP 204/tom kropp gir {} fra _make_request) er
+    # fravær av data, ikke bevis for at oppgaven mangler. Bare en faktisk liste,
+    # også en tom en, kan gi 'trolig_slettet'.
+    tasks = project_data.get('tasks')
+    if not isinstance(tasks, list):
+        logger.warning(f"Kryssjekk mot prosjektdata ga uventet format for project {project_id}: tasks={tasks!r}")
+        return "krysssjekk_feilet"
+
+    task_ids = {t.get('id') for t in tasks if isinstance(t, dict)}
+    return "bekreftet" if task_id in task_ids else "trolig_slettet"
 
 # MCP Tools
 
@@ -242,8 +306,15 @@ async def get_task(project_id: str, task_id: str) -> str:
         task = ticktick.get_task(project_id, task_id)
         if 'error' in task:
             return f"Error fetching task: {task['error']}"
-        
-        return format_task(task)
+
+        # GH-issue #385: enkeltoppslaget viser "Active" ogsaa for slettede
+        # oppgaver. Kryssjekk kun status 0 (Normal): en fullført oppgave (2)
+        # trenger ingen, og andre statuser finnes ikke i /data uansett.
+        status_bekreftelse = None
+        if task.get('status') == 0:
+            status_bekreftelse = _verify_task_active(project_id, task_id)
+
+        return format_task(task, status_bekreftelse=status_bekreftelse)
     except Exception as e:
         logger.error(f"Error in get_task: {e}")
         return f"Error retrieving task: {str(e)}"
