@@ -197,7 +197,10 @@ def _verify_task_active(project_id: str, task_id: str) -> str:
         logger.warning(f"Kryssjekk mot prosjektdata feilet for task {task_id} (project {project_id}): {project_data}")
         return "krysssjekk_feilet"
 
-    tasks = project_data.get('tasks', [])
+    # Et svar UTEN tasks-liste (HTTP 204/tom kropp gir {} fra _make_request) er
+    # fravær av data, ikke bevis for at oppgaven mangler. Bare en faktisk liste,
+    # også en tom en, kan gi 'trolig_slettet'.
+    tasks = project_data.get('tasks')
     if not isinstance(tasks, list):
         logger.warning(f"Kryssjekk mot prosjektdata ga uventet format for project {project_id}: tasks={tasks!r}")
         return "krysssjekk_feilet"

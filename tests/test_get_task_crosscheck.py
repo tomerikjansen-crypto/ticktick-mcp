@@ -88,6 +88,16 @@ class TestVerifyTaskActive(unittest.TestCase):
             resultat = self.modul._verify_task_active("p-1", "t-1")
         self.assertEqual(resultat, "krysssjekk_feilet")
 
+    def test_svar_uten_tasks_gir_krysssjekk_feilet(self):
+        """{} (HTTP 204/tom kropp) og prosjektdata uten tasks er fravær av data,
+        ikke bevis for at oppgaven er slettet (Codex-funn, bølge 4)."""
+        for svar in ({}, {"project": {"id": "p-1"}}):
+            klient = MagicMock()
+            klient.get_project_with_data.return_value = svar
+            with patch.object(self.modul, "ticktick", klient):
+                resultat = self.modul._verify_task_active("p-1", "t-1")
+            self.assertEqual(resultat, "krysssjekk_feilet", svar)
+
     def test_innboks_prosjekt_id_behandles_generisk(self):
         """Innboksens spesielle prosjekt-id sendes urort til /data - samme kontrakt."""
         klient = MagicMock()
