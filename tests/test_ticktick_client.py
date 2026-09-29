@@ -202,6 +202,114 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
         self.assertIn("TICKTICK_REFRESH_TOKEN=\n", innhold)
 
 
+class TestRefreshGrenenFaktisk(unittest.TestCase):
+    """Kjoerer den FAKTISKE _refresh_access_token med simulert HTTP-svar.
+
+    requests.post er mocket (ingen nett), TOKEN_FILE peker til en tmp-fil og
+    cwd er en tom tmp-mappe (.env skrives relativt). Kun TEST-verdier.
+    Kontrollerer minne, delt tokenfil og en ny klientoppstart.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+        from contextlib import ExitStack
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fil = Path(self._tmp.name) / "tokens.json"
+        self.fil.write_text(json.dumps({
+            "access_token": "TEST-access-gammel",
+            "refresh_token": "TEST-refresh-gammel",
+        }), encoding="utf-8")
+
+        gammel_cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+        self.addCleanup(os.chdir, gammel_cwd)
+
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.dict("os.environ", {
+            "TICKTICK_ACCESS_TOKEN": "TEST-access-env",
+            "TICKTICK_REFRESH_TOKEN": "TEST-refresh-env",
+            "TICKTICK_CLIENT_ID": "TEST-cid",
+            "TICKTICK_CLIENT_SECRET": "TEST-csecret",
+        }, clear=True))
+        stack.enter_context(patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", self.fil))
+        stack.enter_context(patch("ticktick_mcp.src.ticktick_client.load_dotenv"))
+
+    def _ny_klient(self):
+        from ticktick_mcp.src.ticktick_client import TickTickClient
+        return TickTickClient()
+
+    def _refresh_med_svar(self, svar):
+        klient = self._ny_klient()
+        self.assertEqual(klient.refresh_token, "TEST-refresh-gammel")
+        respons = MagicMock()
+        respons.raise_for_status.return_value = None
+        respons.json.return_value = svar
+        with patch("ticktick_mcp.src.ticktick_client.requests.post",
+                   return_value=respons) as post:
+            self.assertTrue(klient._refresh_access_token())
+        post.assert_called_once()
+        return klient
+
+    def _fil(self):
+        return json.loads(self.fil.read_text(encoding="utf-8"))
+
+    def _env_fil(self):
+        return (Path(self._tmp.name) / ".env").read_text(encoding="utf-8")
+
+    def _sjekk_ingen_refresh(self, klient):
+        self.assertEqual(klient.access_token, "TEST-access-ny")
+        self.assertIsNone(klient.refresh_token, "minne")
+        self.assertIsNone(self._fil()["refresh_token"], "delt tokenfil skal ha null")
+        self.assertEqual(self._fil()["access_token"], "TEST-access-ny")
+        self.assertNotIn("None", self._env_fil())
+        # Ny oppstart: fila er autoritativ, gammel miljoeverdi brukes ikke
+        self.assertIsNone(self._ny_klient().refresh_token, "ny oppstart")
+
+    def test_refresh_svar_med_null(self):
+        klient = self._refresh_med_svar({"access_token": "TEST-access-ny", "refresh_token": None})
+        self._sjekk_ingen_refresh(klient)
+
+    def test_refresh_svar_med_tom_streng(self):
+        klient = self._refresh_med_svar({"access_token": "TEST-access-ny", "refresh_token": ""})
+        self._sjekk_ingen_refresh(klient)
+
+    def test_refresh_svar_uten_noekkel_beholder_gammel_verdi(self):
+        klient = self._refresh_med_svar({"access_token": "TEST-access-ny"})
+        self.assertEqual(klient.refresh_token, "TEST-refresh-gammel", "minne")
+        self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-gammel")
+        self.assertEqual(self._fil()["access_token"], "TEST-access-ny")
+        self.assertEqual(self._ny_klient().refresh_token, "TEST-refresh-gammel")
+
+    def test_refresh_svar_med_ny_streng(self):
+        klient = self._refresh_med_svar(
+            {"access_token": "TEST-access-ny", "refresh_token": "TEST-refresh-ny"})
+        self.assertEqual(klient.refresh_token, "TEST-refresh-ny")
+        self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-ny")
+        self.assertEqual(self._ny_klient().refresh_token, "TEST-refresh-ny")
+
+    def test_tom_streng_i_fil_ved_oppstart_gir_none(self):
+        self.fil.write_text(json.dumps(
+            {"access_token": "TEST-access-fil", "refresh_token": ""}), encoding="utf-8")
+        self.assertIsNone(self._ny_klient().refresh_token,
+                          "tom streng i fila skal ikke falle tilbake til miljoe")
+
+    def test_tom_streng_i_fil_etter_401_gir_none(self):
+        klient = self._ny_klient()
+        self.fil.write_text(json.dumps(
+            {"access_token": "TEST-access-ny", "refresh_token": ""}), encoding="utf-8")
+        respons_401 = MagicMock(status_code=401)
+        respons_ok = MagicMock(status_code=200, text="{}")
+        respons_ok.json.return_value = {}
+        respons_ok.raise_for_status.return_value = None
+        klient._send = MagicMock(side_effect=[respons_401, respons_ok])
+        klient._make_request("GET", "/project")
+        self.assertEqual(klient.access_token, "TEST-access-ny")
+        self.assertIsNone(klient.refresh_token)
+
+
 class tempfile_cwd:
     """Kontekst: kjoer i en tom midlertidig mappe (for .env-skriving)."""
 

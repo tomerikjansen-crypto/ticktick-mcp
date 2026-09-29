@@ -92,8 +92,9 @@ class TickTickClient:
             # Update the tokens
             self.access_token = tokens.get('access_token')
             if 'refresh_token' in tokens:
-                self.refresh_token = tokens.get('refresh_token')
-                
+                # null eller tom streng betyr "ingen refresh-token", aldri ""
+                self.refresh_token = tokens.get('refresh_token') or None
+
             # Update the headers
             self.headers["Authorization"] = f"Bearer {self.access_token}"
             
@@ -156,6 +157,13 @@ class TickTickClient:
         Har fila noekkelen `refresh_token`, er den autoritativ: en streng
         brukes, null (eller tom streng) gir None uten fallback. Mangler
         noekkelen, brukes fallback (miljoe/.env/minne) som for.
+
+        Kjent forskjell mot dashbordet (ticktick-token.mjs, ikke rettet her):
+        dashbordet har ingen fallback ved manglende noekkel (overtar hele
+        filobjektet), beholder gammel verdi ved null/tom streng i et
+        OAuth-svar (Python erstatter den med None), og adopterer bare ved
+        endret access_token eller nyere tidsstempel (Python overtar
+        refresh-verdien alltid etter 401). Harmonisering er egen endring.
         """
         if "refresh_token" in shared:
             return shared["refresh_token"] or None
