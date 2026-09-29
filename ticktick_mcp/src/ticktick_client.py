@@ -32,7 +32,10 @@ class TickTickClient:
         shared = self._read_token_file()
         if shared:
             self.access_token = shared.get("access_token") or self.access_token
-            self.refresh_token = shared.get("refresh_token") or self.refresh_token
+            # Fila er autoritativ for refresh_token, ogsaa naar verdien er
+            # eksplisitt null (ingen refresh-token utstedt, ny innlogging
+            # kreves). Da skal en gammel verdi fra miljoe/.env IKKE brukes.
+            self.refresh_token = self._refresh_fra_fil(shared, self.refresh_token)
 
         if not self.access_token:
             raise ValueError("TICKTICK_ACCESS_TOKEN environment variable is not set. "
@@ -129,7 +132,8 @@ class TickTickClient:
         # Update with new tokens
         env_content["TICKTICK_ACCESS_TOKEN"] = tokens.get('access_token', '')
         if 'refresh_token' in tokens:
-            env_content["TICKTICK_REFRESH_TOKEN"] = tokens.get('refresh_token', '')
+            # Et eksplisitt null skal aldri bli strengen "None" i .env
+            env_content["TICKTICK_REFRESH_TOKEN"] = tokens.get('refresh_token') or ''
         
         # Make sure client credentials are saved as well
         if self.client_id and "TICKTICK_CLIENT_ID" not in env_content:
@@ -143,6 +147,19 @@ class TickTickClient:
                 f.write(f"{key}={value}\n")
         
         logger.debug("Tokens saved to .env file")
+
+    @staticmethod
+    def _refresh_fra_fil(shared: Dict, fallback: Optional[str]) -> Optional[str]:
+        """
+        Velg refresh_token naar den delte tokenfila er lest (har access_token).
+
+        Har fila noekkelen `refresh_token`, er den autoritativ: en streng
+        brukes, null (eller tom streng) gir None uten fallback. Mangler
+        noekkelen, brukes fallback (miljoe/.env/minne) som for.
+        """
+        if "refresh_token" in shared:
+            return shared["refresh_token"] or None
+        return fallback
 
     def _read_token_file(self) -> Optional[Dict]:
         """Les den delte tokenfila. Returnerer None ved manglende/korrupt fil."""
@@ -202,12 +219,14 @@ class TickTickClient:
                 # Node-serveren kan alt ha fornyet tokenet - les delt fil
                 # foer vi brenner vaar egen refresh (refresh_token roterer)
                 shared = self._read_token_file()
-                if shared and shared.get("access_token") and shared["access_token"] != self.access_token:
-                    logger.info("Using refreshed token from shared token file.")
-                    self.access_token = shared["access_token"]
-                    self.refresh_token = shared.get("refresh_token") or self.refresh_token
-                    self.headers["Authorization"] = f"Bearer {self.access_token}"
-                    response = self._send(method, url, data)
+                if shared and shared.get("access_token"):
+                    # Fila er autoritativ for refresh_token, ogsaa naar den er null
+                    self.refresh_token = self._refresh_fra_fil(shared, self.refresh_token)
+                    if shared["access_token"] != self.access_token:
+                        logger.info("Using refreshed token from shared token file.")
+                        self.access_token = shared["access_token"]
+                        self.headers["Authorization"] = f"Bearer {self.access_token}"
+                        response = self._send(method, url, data)
 
             if response.status_code == 401:
                 logger.info("Access token expired. Attempting to refresh...")

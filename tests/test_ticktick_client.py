@@ -100,6 +100,125 @@ class TestTokenFilForrang(unittest.TestCase):
         self.assertEqual(klient.access_token, "token-fra-env")
 
 
+class TestRefreshTokenNullAutoritativ(unittest.TestCase):
+    """Fila er autoritativ for refresh_token, ogsaa naar den er eksplisitt null.
+
+    Bruker en ekte midlertidig tokenfil (TOKEN_FILE pekes til tmp-sti) og
+    oppdiktede TEST-verdier. Speiler dashbordets ticktick-token.mjs, der
+    null betyr "ingen refresh-token".
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fil = Path(self._tmp.name) / "tokens.json"
+
+    def _skriv(self, data):
+        self.fil.write_text(json.dumps(data), encoding="utf-8")
+
+    def _opprett_klient(self, env=None):
+        miljo = {
+            "TICKTICK_ACCESS_TOKEN": "TEST-access-env",
+            "TICKTICK_REFRESH_TOKEN": "TEST-refresh-env",
+            "TICKTICK_CLIENT_ID": "TEST-cid",
+            "TICKTICK_CLIENT_SECRET": "TEST-csecret",
+        }
+        if env is not None:
+            miljo = env
+        with patch.dict("os.environ", miljo, clear=True), \
+                patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", self.fil), \
+                patch("ticktick_mcp.src.ticktick_client.load_dotenv"):
+            from ticktick_mcp.src.ticktick_client import TickTickClient
+            return TickTickClient()
+
+    def test_fil_med_null_overstyrer_gammel_verdi_i_miljo(self):
+        self._skriv({"access_token": "TEST-access-fil", "refresh_token": None})
+        klient = self._opprett_klient()
+        self.assertEqual(klient.access_token, "TEST-access-fil")
+        self.assertIsNone(klient.refresh_token,
+                          "null i fila skal gi None, ikke gammel miljoeverdi")
+
+    def test_fil_uten_noekkel_faller_tilbake_paa_miljo(self):
+        self._skriv({"access_token": "TEST-access-fil"})
+        klient = self._opprett_klient()
+        self.assertEqual(klient.refresh_token, "TEST-refresh-env")
+
+    def test_fil_med_streng_brukes(self):
+        self._skriv({"access_token": "TEST-access-fil", "refresh_token": "TEST-refresh-fil"})
+        klient = self._opprett_klient()
+        self.assertEqual(klient.refresh_token, "TEST-refresh-fil")
+
+    def test_uten_fil_faller_tilbake_paa_miljo(self):
+        klient = self._opprett_klient()  # self.fil finnes ikke
+        self.assertEqual(klient.refresh_token, "TEST-refresh-env")
+
+    def test_fil_uten_access_token_er_ikke_autoritativ(self):
+        self._skriv({"access_token": "", "refresh_token": None})
+        klient = self._opprett_klient()
+        self.assertEqual(klient.access_token, "TEST-access-env")
+        self.assertEqual(klient.refresh_token, "TEST-refresh-env")
+
+    def _respons(self, status_code):
+        mock = MagicMock()
+        mock.status_code = status_code
+        mock.text = "{}"
+        mock.json.return_value = {}
+        if status_code >= 400:
+            from requests.exceptions import HTTPError
+            mock.raise_for_status.side_effect = HTTPError(response=mock)
+        else:
+            mock.raise_for_status.return_value = None
+        return mock
+
+    def test_adopsjon_etter_401_med_null_gir_none(self):
+        klient = _lag_klient_direkte(access_token="TEST-gammel-access",
+                                     refresh_token="TEST-gammel-refresh")
+        self._skriv({"access_token": "TEST-ny-access", "refresh_token": None})
+        klient._send = MagicMock(side_effect=[self._respons(401), self._respons(200)])
+        with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", self.fil):
+            klient._make_request("GET", "/project")
+        self.assertEqual(klient.access_token, "TEST-ny-access")
+        self.assertIsNone(klient.refresh_token,
+                          "adopsjon etter 401 skal ikke bevare gammel refresh-verdi naar fila har null")
+
+    def test_401_med_null_i_fil_og_samme_access_gir_ikke_refresh_forsoek(self):
+        klient = _lag_klient_direkte(access_token="TEST-samme", refresh_token="TEST-gammel-refresh")
+        self._skriv({"access_token": "TEST-samme", "refresh_token": None})
+        klient._send = MagicMock(return_value=self._respons(401))
+        with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", self.fil), \
+                patch("ticktick_mcp.src.ticktick_client.requests.post") as post:
+            resultat = klient._make_request("GET", "/project")
+        post.assert_not_called()
+        self.assertIn("error", resultat)
+        self.assertIsNone(klient.refresh_token)
+
+    def test_lagring_til_env_gjor_ikke_null_til_streng(self):
+        klient = _lag_klient_direkte()
+        with tempfile_cwd() as ws:
+            klient._save_tokens_to_env({"access_token": "TEST-a", "refresh_token": None})
+            innhold = (Path(ws) / ".env").read_text(encoding="utf-8")
+        self.assertNotIn("None", innhold)
+        self.assertIn("TICKTICK_REFRESH_TOKEN=\n", innhold)
+
+
+class tempfile_cwd:
+    """Kontekst: kjoer i en tom midlertidig mappe (for .env-skriving)."""
+
+    def __enter__(self):
+        import os
+        import tempfile
+        self._gammel = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+        return self._tmp.name
+
+    def __exit__(self, *exc):
+        import os
+        os.chdir(self._gammel)
+        self._tmp.cleanup()
+
+
 class TestManglendToken(unittest.TestCase):
     """Scenario 2: Manglende access_token skal gi ValueError."""
 
