@@ -3,6 +3,7 @@ import json
 import base64
 import requests
 import logging
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -41,8 +42,13 @@ def skriv_token_fil(access_token: str, refresh_token: Optional[str], kilde: str,
     authenticate/auth.py, saa begge lager samme format: access_token,
     refresh_token (streng eller null), oppdatert (ISO) og kilde.
 
+    Midlertidig fil har unikt navn per skriving (mkstemp i samme mappe som
+    maalfila), saa samtidige skrivere ikke blander innhold. Egen temp-fil ryddes
+    ved feil, og tillatelsene settes til 0o600 der det er stoettet.
+
     Returnerer True ved vellykket skriving, False ved OSError (logges uten tokenverdier).
     """
+    tmp: Optional[Path] = None
     try:
         TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -51,13 +57,28 @@ def skriv_token_fil(access_token: str, refresh_token: Optional[str], kilde: str,
             "oppdatert": (oppdatert or datetime.now(timezone.utc)).isoformat(),
             "kilde": kilde,
         }
-        tmp = TOKEN_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        fd, tmp_navn = tempfile.mkstemp(dir=str(TOKEN_FILE.parent),
+                                        prefix=TOKEN_FILE.name + ".", suffix=".tmp")
+        tmp = Path(tmp_navn)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, indent=2))
+        # Lukket foer replace (viktig paa Windows). Ingen feil hvis chmod ikke stoettes.
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
         tmp.replace(TOKEN_FILE)
+        tmp = None
         return True
     except OSError as e:
         logger.warning(f"Could not write shared token file: {e}")
         return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 class TickTickClient:
@@ -157,11 +178,16 @@ class TickTickClient:
             # Update the headers
             self.headers["Authorization"] = f"Bearer {self.access_token}"
             
-            # Save the tokens to the .env file
-            self._save_tokens_to_env(tokens)
-
-            # Hold den delte tokenfila i synk slik at Node-serveren ser fornyelsen
+            # Den autoritative tokenfila FOERST (den registrerer ogsaa klientens
+            # nye tidspunkt foer noe kan feile), slik at Node-serveren ser fornyelsen
             self._write_token_file()
+
+            # .env er sekundaer lagring: en feil her skal aldri hindre resten
+            try:
+                self._save_tokens_to_env(tokens)
+            except OSError as e:
+                logger.warning(f"Could not write .env file ({type(e).__name__}). "
+                               "The shared token file was handled separately.")
 
             logger.info("Access token refreshed successfully.")
             return True
@@ -240,7 +266,8 @@ class TickTickClient:
                 if not isinstance(data, dict):
                     logger.warning("Shared token file is not a JSON object. Ignoring it.")
                     return None
-                if data.get("access_token"):
+                token = data.get("access_token")
+                if isinstance(token, str) and token.strip():
                     return data
         except (OSError, ValueError) as e:
             # ValueError dekker baade JSONDecodeError og UnicodeDecodeError
@@ -258,16 +285,14 @@ class TickTickClient:
     def _filen_er_nyere(self, shared: Dict) -> bool:
         """
         Er den delte fila nyere enn det klienten sist leste eller skrev?
-        Samme prinsipp som dashbordet (ticktick-token.mjs, funn 9): ulik
-        access_token, eller nyere `oppdatert`. Har begge tidsstempel, vinner
-        tidsstempelet (en eldre fil adopteres ikke selv om access_token er ulik).
+        Har klienten et kjent tidspunkt, kreves et STRENGT nyere, gyldig
+        tidspunkt i fila: like, manglende og ugyldige tidsstempel avvises, uansett
+        om access_token er ulik. Bare uten kjent tidspunkt (fersk start uten lest
+        fil) brukes ulik access_token som bevis, som dashbordet (ticktick-token.mjs).
         """
-        fil_tid = _parse_tid(shared.get("oppdatert"))
-        if fil_tid and self._fil_oppdatert:
-            if fil_tid < self._fil_oppdatert:
-                return False
-            if fil_tid > self._fil_oppdatert:
-                return True
+        if self._fil_oppdatert:
+            fil_tid = _parse_tid(shared.get("oppdatert"))
+            return bool(fil_tid and fil_tid > self._fil_oppdatert)
         return shared["access_token"] != self.access_token
 
     def _send(self, method: str, url: str, data=None):
@@ -301,16 +326,21 @@ class TickTickClient:
                 # Node-serveren kan alt ha fornyet tokenet - les delt fil
                 # foer vi brenner vaar egen refresh (refresh_token roterer)
                 shared = self._read_token_file()
-                if shared and shared.get("access_token") and self._filen_er_nyere(shared):
-                    # Fila er autoritativ for refresh_token, ogsaa naar den er null,
-                    # men bare naar den faktisk er nyere enn vaar tilstand
-                    self.refresh_token = self._refresh_fra_fil(shared, self.refresh_token)
+                if shared and self._filen_er_nyere(shared):
                     self._fil_oppdatert = _parse_tid(shared.get("oppdatert")) or self._fil_oppdatert
                     if shared["access_token"] != self.access_token:
+                        # Ny access_token adopteres: fila er autoritativ for
+                        # refresh_token ogsaa naar den er null
                         logger.info("Using refreshed token from shared token file.")
+                        self.refresh_token = self._refresh_fra_fil(shared, self.refresh_token)
                         self.access_token = shared["access_token"]
                         self.headers["Authorization"] = f"Bearer {self.access_token}"
                         response = self._send(method, url, data)
+                    else:
+                        # Samme access_token: null/manglende i fila skal aldri nulle et
+                        # gyldig refresh-token i minnet, bare en faktisk ny streng adopteres
+                        self.refresh_token = normaliser_refresh_token(
+                            shared.get("refresh_token")) or self.refresh_token
 
             if response.status_code == 401:
                 logger.info("Access token expired. Attempting to refresh...")

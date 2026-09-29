@@ -296,12 +296,28 @@ class TickTickAuth:
             
             # Parse the response
             self.tokens = response.json()
-            
-            # Save the tokens to the .env file
-            self._save_tokens_to_env()
-            
-            return "Authentication successful! Access token saved to .env file."
-            
+
+            # Avvis svar uten gyldig access_token (ogsaa naar JSON-roten ikke er
+            # et objekt), som klienten gjoer. Ingen tokenverdier i loggen.
+            if not isinstance(self.tokens, dict) or not isinstance(
+                    self.tokens.get('access_token'), str) or not self.tokens['access_token'].strip():
+                logger.error("Token response had no valid access_token. Nothing was saved.")
+                self.tokens = None
+                return ("Error exchanging code for token: the response contained no valid "
+                        "access token. Nothing was saved. Please try again.")
+
+            # Tokenfila (autoritativ) skrives foerst, saa .env
+            fil_ok, env_ok = self._save_tokens_to_env()
+
+            if not fil_ok:
+                return ("Error: the login could not be saved to the shared token file, which "
+                        "takes precedence at startup, so the new login will NOT take effect. "
+                        "Check write access to the token file folder and try again.")
+            if not env_ok:
+                return ("Authentication successful. The shared token file was updated, but "
+                        ".env could not be written.")
+            return "Authentication successful! Access token saved to the shared token file and .env."
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Error exchanging code for token: {e}")
             if hasattr(e, 'response') and e.response is not None:
@@ -312,11 +328,32 @@ class TickTickAuth:
                     return f"Error exchanging code for token: {e.response.text}"
             return f"Error exchanging code for token: {str(e)}"
     
-    def _save_tokens_to_env(self) -> None:
-        """Save the tokens to the .env file."""
-        if not self.tokens:
-            return
-        
+    def _save_tokens_to_env(self) -> Tuple[bool, bool]:
+        """
+        Lagre tokens: den delte tokenfila FOERST (den vinner ved oppstart), saa .env.
+
+        Returns:
+            (tokenfil_ok, env_ok). En feil i .env hindrer aldri tokenfila.
+        """
+        if not self.tokens or not self.tokens.get('access_token'):
+            return (False, False)
+
+        # refresh_token uten nokkel i svaret gir null, som ticktick-auth.mjs.
+        fil_ok = skriv_token_fil(self.tokens['access_token'],
+                                 self.tokens.get('refresh_token'), "python-auth")
+        if not fil_ok:
+            logger.warning("Could not update the shared token file; the new login may "
+                           "not take effect until it is written.")
+        try:
+            self._skriv_env()
+            env_ok = True
+        except OSError as e:
+            logger.warning(f"Could not write .env file ({type(e).__name__}).")
+            env_ok = False
+        return (fil_ok, env_ok)
+
+    def _skriv_env(self) -> None:
+        """Skriv tokens til .env (kan kaste OSError)."""
         # Load existing .env file content
         env_path = Path('.env')
         env_content = {}
@@ -349,15 +386,6 @@ class TickTickAuth:
                 f.write(f"{key}={value}\n")
         
         logger.info("Tokens saved to .env file")
-
-        # Den delte tokenfila vinner over .env ved oppstart, saa en ny innlogging
-        # maa skrives dit ogsaa (samme format og skrivefunksjon som klienten).
-        # refresh_token uten nokkel i svaret gir null, som ticktick-auth.mjs.
-        if self.tokens.get('access_token'):
-            if not skriv_token_fil(self.tokens['access_token'],
-                                   self.tokens.get('refresh_token'), "python-auth"):
-                logger.warning("Could not update the shared token file; the new login may "
-                               "not take effect until it is written.")
 
 def setup_auth_cli():
     """Run the authentication flow as a CLI utility."""
