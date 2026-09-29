@@ -8,9 +8,25 @@ Dekker tre scenarier fra F048:
 """
 
 import json
+import os
+import tempfile
 import unittest
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, mock_open
+
+
+@contextmanager
+def i_tom_mappe():
+    """Kjoer i en tom midlertidig mappe (for .env-skriving). Gir mappestien."""
+    gammel = os.getcwd()
+    with tempfile.TemporaryDirectory() as mappe:
+        os.chdir(mappe)
+        try:
+            yield mappe
+        finally:
+            os.chdir(gammel)
 
 
 # Hjelper: bygg en ferdig klient uten __init__-logikk
@@ -182,24 +198,78 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
         self.assertIsNone(klient.refresh_token,
                           "adopsjon etter 401 skal ikke bevare gammel refresh-verdi naar fila har null")
 
-    def test_401_med_null_i_fil_og_samme_access_gir_ikke_refresh_forsoek(self):
-        klient = _lag_klient_direkte(access_token="TEST-samme", refresh_token="TEST-gammel-refresh")
-        self._skriv({"access_token": "TEST-samme", "refresh_token": None})
+    def _401_med_fil(self, klient, fil_data):
+        """Kjoer en 401 mot en tokenfil. Gir (resultat, requests.post-mocken)."""
+        self._skriv(fil_data)
         klient._send = MagicMock(return_value=self._respons(401))
         with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", self.fil), \
                 patch("ticktick_mcp.src.ticktick_client.requests.post") as post:
             resultat = klient._make_request("GET", "/project")
+        return resultat, post
+
+    def test_401_fil_med_null_og_nyere_tidsstempel_adopteres_uten_refresh_forsoek(self):
+        naa = datetime.now(timezone.utc)
+        klient = _lag_klient_direkte(access_token="TEST-samme", refresh_token="TEST-gammel-refresh",
+                                     _fil_oppdatert=naa - timedelta(minutes=5))
+        resultat, post = self._401_med_fil(klient, {
+            "access_token": "TEST-samme", "refresh_token": None,
+            "oppdatert": naa.isoformat()})
         post.assert_not_called()
         self.assertIn("error", resultat)
         self.assertIsNone(klient.refresh_token)
 
+    def test_401_fil_med_samme_access_og_uten_nyere_tidsstempel_adopteres_ikke(self):
+        """Funn 4: en fil som ikke er nyere skal ikke nullstille refresh-tokenen i minnet."""
+        naa = datetime.now(timezone.utc)
+        for oppdatert in (None, (naa - timedelta(minutes=5)).isoformat(), naa.isoformat()):
+            with self.subTest(oppdatert=oppdatert):
+                klient = _lag_klient_direkte(access_token="TEST-samme",
+                                             refresh_token="TEST-gammel-refresh",
+                                             _fil_oppdatert=naa)
+                fil = {"access_token": "TEST-samme", "refresh_token": None}
+                if oppdatert:
+                    fil["oppdatert"] = oppdatert
+                respons = MagicMock()
+                respons.json.return_value = {"access_token": "TEST-fornyet"}
+                respons.raise_for_status.return_value = None
+                self._skriv(fil)
+                klient._send = MagicMock(side_effect=[self._respons(401), self._respons(200)])
+                with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", self.fil), \
+                        patch("ticktick_mcp.src.ticktick_client.requests.post",
+                              return_value=respons) as post, \
+                        i_tom_mappe():
+                    klient._make_request("GET", "/project")
+                post.assert_called_once()  # egen refresh med beholdt refresh-token
+                self.assertEqual(post.call_args.kwargs["data"]["refresh_token"],
+                                 "TEST-gammel-refresh")
+
+    def test_401_eldre_fil_med_annen_access_adopteres_ikke(self):
+        naa = datetime.now(timezone.utc)
+        klient = _lag_klient_direkte(access_token="TEST-ny-i-minnet",
+                                     refresh_token="TEST-rotert-refresh", _fil_oppdatert=naa)
+        resultat, post = self._401_med_fil(klient, {
+            "access_token": "TEST-gammel-i-fil", "refresh_token": "TEST-doed-refresh",
+            "oppdatert": (naa - timedelta(hours=1)).isoformat()})
+        self.assertEqual(klient.access_token, "TEST-ny-i-minnet")
+        self.assertEqual(klient.refresh_token, "TEST-rotert-refresh")
+
     def test_lagring_til_env_gjor_ikke_null_til_streng(self):
         klient = _lag_klient_direkte()
-        with tempfile_cwd() as ws:
+        with i_tom_mappe() as ws:
             klient._save_tokens_to_env({"access_token": "TEST-a", "refresh_token": None})
             innhold = (Path(ws) / ".env").read_text(encoding="utf-8")
         self.assertNotIn("None", innhold)
-        self.assertIn("TICKTICK_REFRESH_TOKEN=\n", innhold)
+        self.assertNotIn("TICKTICK_REFRESH_TOKEN", innhold)
+
+    def test_lagring_til_env_beholder_eksisterende_refresh_ved_null_og_tom(self):
+        klient = _lag_klient_direkte()
+        for svar in (None, ""):
+            with self.subTest(refresh=svar), i_tom_mappe() as ws:
+                (Path(ws) / ".env").write_text("TICKTICK_REFRESH_TOKEN=TEST-eksisterende\n",
+                                               encoding="utf-8")
+                klient._save_tokens_to_env({"access_token": "TEST-a", "refresh_token": svar})
+                innhold = (Path(ws) / ".env").read_text(encoding="utf-8")
+                self.assertIn("TICKTICK_REFRESH_TOKEN=TEST-eksisterende\n", innhold)
 
 
 class TestRefreshGrenenFaktisk(unittest.TestCase):
@@ -259,29 +329,95 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
     def _env_fil(self):
         return (Path(self._tmp.name) / ".env").read_text(encoding="utf-8")
 
-    def _sjekk_ingen_refresh(self, klient):
+    def _sjekk_gammel_refresh_beholdt(self, klient):
+        """Et OAuth-svar uten faktisk ny refresh-token betyr "ikke rotert": behold den gamle."""
         self.assertEqual(klient.access_token, "TEST-access-ny")
-        self.assertIsNone(klient.refresh_token, "minne")
-        self.assertIsNone(self._fil()["refresh_token"], "delt tokenfil skal ha null")
+        self.assertEqual(klient.refresh_token, "TEST-refresh-gammel", "minne")
+        self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-gammel", "delt tokenfil")
         self.assertEqual(self._fil()["access_token"], "TEST-access-ny")
         self.assertNotIn("None", self._env_fil())
-        # Ny oppstart: fila er autoritativ, gammel miljoeverdi brukes ikke
-        self.assertIsNone(self._ny_klient().refresh_token, "ny oppstart")
+        self.assertEqual(self._ny_klient().refresh_token, "TEST-refresh-gammel", "ny oppstart")
 
-    def test_refresh_svar_med_null(self):
+    def test_refresh_svar_med_null_beholder_gammel_verdi(self):
         klient = self._refresh_med_svar({"access_token": "TEST-access-ny", "refresh_token": None})
-        self._sjekk_ingen_refresh(klient)
+        self._sjekk_gammel_refresh_beholdt(klient)
 
-    def test_refresh_svar_med_tom_streng(self):
+    def test_refresh_svar_med_tom_streng_beholder_gammel_verdi(self):
         klient = self._refresh_med_svar({"access_token": "TEST-access-ny", "refresh_token": ""})
-        self._sjekk_ingen_refresh(klient)
+        self._sjekk_gammel_refresh_beholdt(klient)
 
     def test_refresh_svar_uten_noekkel_beholder_gammel_verdi(self):
         klient = self._refresh_med_svar({"access_token": "TEST-access-ny"})
-        self.assertEqual(klient.refresh_token, "TEST-refresh-gammel", "minne")
-        self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-gammel")
-        self.assertEqual(self._fil()["access_token"], "TEST-access-ny")
-        self.assertEqual(self._ny_klient().refresh_token, "TEST-refresh-gammel")
+        self._sjekk_gammel_refresh_beholdt(klient)
+
+    def test_refresh_svar_uten_access_token_avvises(self):
+        """Funn 6: svar uten access_token skal ikke nullstille gamle verdier."""
+        klient = self._ny_klient()
+        for svar in ({}, {"refresh_token": "TEST-refresh-ny"},
+                     {"access_token": None}, {"access_token": ""}):
+            with self.subTest(svar=svar):
+                respons = MagicMock()
+                respons.raise_for_status.return_value = None
+                respons.json.return_value = svar
+                with patch("ticktick_mcp.src.ticktick_client.requests.post",
+                           return_value=respons):
+                    self.assertFalse(klient._refresh_access_token())
+                self.assertEqual(klient.access_token, "TEST-access-gammel")
+                self.assertEqual(klient.refresh_token, "TEST-refresh-gammel")
+                self.assertEqual(klient.headers["Authorization"], "Bearer TEST-access-gammel")
+                self.assertEqual(self._fil()["access_token"], "TEST-access-gammel")
+                self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-gammel")
+
+    def test_feilende_filskriving_gir_ikke_tap_av_refresh_i_minnet(self):
+        """Funn 4/8: OSError ved skriving. Minnet beholder den roterte tokenen, og en
+        eldre fil adopteres ikke etter en senere 401."""
+        self.fil.write_text(json.dumps({
+            "access_token": "TEST-access-gammel", "refresh_token": "TEST-refresh-gammel",
+            "oppdatert": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+        }), encoding="utf-8")
+        klient = self._ny_klient()
+        respons = MagicMock()
+        respons.raise_for_status.return_value = None
+        respons.json.return_value = {"access_token": "TEST-access-ny",
+                                     "refresh_token": "TEST-refresh-rotert"}
+        with patch("ticktick_mcp.src.ticktick_client.requests.post", return_value=respons), \
+                patch("pathlib.Path.replace", side_effect=OSError("TEST-skrivefeil")):
+            self.assertTrue(klient._refresh_access_token())
+        self.assertEqual(klient.refresh_token, "TEST-refresh-rotert")
+        self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-gammel", "fila er uendret")
+
+        # Senere 401: den gamle fila (ulik access_token, eldre tidsstempel) skal ikke adopteres
+        klient._send = MagicMock(side_effect=[self._respons_401(), self._respons_401()])
+        with patch("ticktick_mcp.src.ticktick_client.requests.post") as post:
+            klient._make_request("GET", "/project")
+        self.assertEqual(klient.access_token, "TEST-access-ny")
+        self.assertEqual(klient.refresh_token, "TEST-refresh-rotert")
+        self.assertEqual(post.call_args.kwargs["data"]["refresh_token"], "TEST-refresh-rotert")
+
+    @staticmethod
+    def _respons_401():
+        mock = MagicMock(status_code=401)
+        from requests.exceptions import HTTPError
+        mock.raise_for_status.side_effect = HTTPError(response=mock)
+        return mock
+
+    def test_korrupt_fil_faller_tilbake_som_ved_manglende_fil(self):
+        """Funn 7: JSON-rot som ikke er et objekt, ugyldig JSON og ugyldig UTF-8."""
+        for innhold in (b"[]", b"null", b"\"tekst\"", b"42", b"{ikke json", b"\xff\xfe\x00\xd8"):
+            with self.subTest(innhold=innhold):
+                self.fil.write_bytes(innhold)
+                klient = self._ny_klient()  # skal ikke kaste
+                self.assertEqual(klient.access_token, "TEST-access-env")
+                self.assertEqual(klient.refresh_token, "TEST-refresh-env")
+
+    def test_korrupt_fil_etter_401_kaster_ikke(self):
+        klient = self._ny_klient()
+        self.fil.write_bytes(b"[]")
+        klient._send = MagicMock(side_effect=[self._respons_401(), self._respons_401()])
+        with patch("ticktick_mcp.src.ticktick_client.requests.post"):
+            resultat = klient._make_request("GET", "/project")
+        self.assertIn("error", resultat)
+        self.assertEqual(klient.refresh_token, "TEST-refresh-gammel")
 
     def test_refresh_svar_med_ny_streng(self):
         klient = self._refresh_med_svar(
@@ -310,21 +446,75 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
         self.assertIsNone(klient.refresh_token)
 
 
-class tempfile_cwd:
-    """Kontekst: kjoer i en tom midlertidig mappe (for .env-skriving)."""
+class TestAuthSkriverTokenfilOgEnv(unittest.TestCase):
+    """authenticate/auth.py skal skrive .env uten "None" OG den delte tokenfila
+    (som vinner ved oppstart), i samme format som klienten. Kun TEST-verdier."""
 
-    def __enter__(self):
-        import os
-        import tempfile
-        self._gammel = os.getcwd()
-        self._tmp = tempfile.TemporaryDirectory()
-        os.chdir(self._tmp.name)
-        return self._tmp.name
+    def _lagre(self, tokens, eksisterende_env=None):
+        from ticktick_mcp.src.auth import TickTickAuth
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("ticktick_mcp.src.auth.load_dotenv"), \
+                i_tom_mappe() as mappe:
+            fil = Path(mappe) / "delt" / "tokens.json"
+            if eksisterende_env:
+                (Path(mappe) / ".env").write_text(eksisterende_env, encoding="utf-8")
+            auth = TickTickAuth(client_id="TEST-cid", client_secret="TEST-csecret")
+            auth.tokens = tokens
+            with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", fil):
+                auth._save_tokens_to_env()
+            env = (Path(mappe) / ".env").read_text(encoding="utf-8")
+            data = json.loads(fil.read_text(encoding="utf-8")) if fil.exists() else None
+        return env, data
 
-    def __exit__(self, *exc):
-        import os
-        os.chdir(self._gammel)
-        self._tmp.cleanup()
+    def test_null_refresh_gir_ikke_none_i_env_og_null_i_tokenfil(self):
+        env, data = self._lagre({"access_token": "TEST-a", "refresh_token": None},
+                                "TICKTICK_REFRESH_TOKEN=TEST-gammel\n")
+        self.assertNotIn("None", env)
+        self.assertIn("TICKTICK_REFRESH_TOKEN=\n", env)
+        self.assertEqual(data["access_token"], "TEST-a")
+        self.assertIsNone(data["refresh_token"])
+        self.assertEqual(data["kilde"], "python-auth")
+        self.assertIsNotNone(datetime.fromisoformat(data["oppdatert"]))
+        self.assertEqual(set(data), {"access_token", "refresh_token", "oppdatert", "kilde"})
+
+    def test_refresh_uten_noekkel_gir_null_i_tokenfil(self):
+        env, data = self._lagre({"access_token": "TEST-a"})
+        self.assertNotIn("None", env)
+        self.assertIsNone(data["refresh_token"])
+
+    def test_refresh_streng_skrives_begge_steder(self):
+        env, data = self._lagre({"access_token": "TEST-a", "refresh_token": "TEST-r"})
+        self.assertIn("TICKTICK_REFRESH_TOKEN=TEST-r\n", env)
+        self.assertEqual(data["refresh_token"], "TEST-r")
+
+    def test_ny_innlogging_via_auth_faar_effekt_ved_klientoppstart(self):
+        """Funn 3: fila vinner over .env, saa auth maa skrive den for at innloggingen skal virke."""
+        from ticktick_mcp.src.auth import TickTickAuth
+        from ticktick_mcp.src.ticktick_client import TickTickClient
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("ticktick_mcp.src.auth.load_dotenv"), \
+                patch("ticktick_mcp.src.ticktick_client.load_dotenv"), \
+                i_tom_mappe() as mappe:
+            fil = Path(mappe) / "tokens.json"
+            fil.write_text(json.dumps({"access_token": "TEST-utgaatt",
+                                       "refresh_token": None}), encoding="utf-8")
+            auth = TickTickAuth(client_id="TEST-cid", client_secret="TEST-csecret")
+            auth.tokens = {"access_token": "TEST-ny-innlogging", "refresh_token": "TEST-ny-refresh"}
+            with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", fil):
+                auth._save_tokens_to_env()
+                klient = TickTickClient()
+        self.assertEqual(klient.access_token, "TEST-ny-innlogging")
+        self.assertEqual(klient.refresh_token, "TEST-ny-refresh")
+
+
+class TestNormaliserRefreshToken(unittest.TestCase):
+    """Funn 10: regelen "null eller tom betyr ingen" ligger i en hjelper."""
+
+    def test_regelen(self):
+        from ticktick_mcp.src.ticktick_client import normaliser_refresh_token
+        self.assertEqual(normaliser_refresh_token("TEST-r"), "TEST-r")
+        for verdi in (None, "", "   ", 0, 42, [], {}, False):
+            self.assertIsNone(normaliser_refresh_token(verdi), repr(verdi))
 
 
 class TestManglendToken(unittest.TestCase):

@@ -20,6 +20,8 @@ from typing import Dict, Optional, Tuple, Any
 from dotenv import load_dotenv
 import logging
 
+from .ticktick_client import normaliser_refresh_token, skriv_token_fil
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -330,7 +332,10 @@ class TickTickAuth:
         # Update with new tokens
         env_content["TICKTICK_ACCESS_TOKEN"] = self.tokens.get('access_token', '')
         if 'refresh_token' in self.tokens:
-            env_content["TICKTICK_REFRESH_TOKEN"] = self.tokens.get('refresh_token', '')
+            # Ny innlogging: null/tom betyr ingen refresh-token utstedt. Skriv
+            # tom verdi (aldri strengen "None") slik at en gammel ikke blir staaende
+            env_content["TICKTICK_REFRESH_TOKEN"] = normaliser_refresh_token(
+                self.tokens.get('refresh_token')) or ''
         
         # Make sure client credentials are saved as well
         if self.client_id and "TICKTICK_CLIENT_ID" not in env_content:
@@ -344,6 +349,15 @@ class TickTickAuth:
                 f.write(f"{key}={value}\n")
         
         logger.info("Tokens saved to .env file")
+
+        # Den delte tokenfila vinner over .env ved oppstart, saa en ny innlogging
+        # maa skrives dit ogsaa (samme format og skrivefunksjon som klienten).
+        # refresh_token uten nokkel i svaret gir null, som ticktick-auth.mjs.
+        if self.tokens.get('access_token'):
+            if not skriv_token_fil(self.tokens['access_token'],
+                                   self.tokens.get('refresh_token'), "python-auth"):
+                logger.warning("Could not update the shared token file; the new login may "
+                               "not take effect until it is written.")
 
 def setup_auth_cli():
     """Run the authentication flow as a CLI utility."""

@@ -15,11 +15,59 @@ logger = logging.getLogger(__name__)
 # fase 2 K5): ett token-system paa tvers av Python og Node.
 TOKEN_FILE = Path.home() / ".ticktick" / "tokens.json"
 
+
+def normaliser_refresh_token(verdi: Any) -> Optional[str]:
+    """Regelen paa ett sted: null, tom streng eller ikke-streng betyr "ingen refresh-token"."""
+    if isinstance(verdi, str) and verdi.strip():
+        return verdi
+    return None
+
+
+def _parse_tid(verdi: Any) -> Optional[datetime]:
+    """Tolk en ISO-tidsstempel (Python +00:00 eller JS Z). None ved feil."""
+    if not isinstance(verdi, str) or not verdi:
+        return None
+    try:
+        tid = datetime.fromisoformat(verdi.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return tid if tid.tzinfo else tid.replace(tzinfo=timezone.utc)
+
+
+def skriv_token_fil(access_token: str, refresh_token: Optional[str], kilde: str,
+                    oppdatert: Optional[datetime] = None) -> bool:
+    """
+    Skriv den delte tokenfila atomisk (tmp+replace). Felles for klienten og
+    authenticate/auth.py, saa begge lager samme format: access_token,
+    refresh_token (streng eller null), oppdatert (ISO) og kilde.
+
+    Returnerer True ved vellykket skriving, False ved OSError (logges uten tokenverdier).
+    """
+    try:
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "access_token": access_token,
+            "refresh_token": normaliser_refresh_token(refresh_token),
+            "oppdatert": (oppdatert or datetime.now(timezone.utc)).isoformat(),
+            "kilde": kilde,
+        }
+        tmp = TOKEN_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(TOKEN_FILE)
+        return True
+    except OSError as e:
+        logger.warning(f"Could not write shared token file: {e}")
+        return False
+
+
 class TickTickClient:
     """
     Client for the TickTick API using OAuth2 authentication.
     """
-    
+
+    # Tidsstempel for siste tokenfil klienten leste eller skrev (adopsjon etter 401)
+    _fil_oppdatert: Optional[datetime] = None
+
     def __init__(self):
         load_dotenv()
         self.client_id = os.getenv("TICKTICK_CLIENT_ID")
@@ -36,6 +84,7 @@ class TickTickClient:
             # eksplisitt null (ingen refresh-token utstedt, ny innlogging
             # kreves). Da skal en gammel verdi fra miljoe/.env IKKE brukes.
             self.refresh_token = self._refresh_fra_fil(shared, self.refresh_token)
+            self._fil_oppdatert = _parse_tid(shared.get("oppdatert"))
 
         if not self.access_token:
             raise ValueError("TICKTICK_ACCESS_TOKEN environment variable is not set. "
@@ -88,12 +137,22 @@ class TickTickClient:
             
             # Parse the response
             tokens = response.json()
-            
+
+            # Et svar uten access_token er ubrukelig: behold gamle verdier
+            # (logger aldri tokenverdier)
+            ny_access = tokens.get('access_token') if isinstance(tokens, dict) else None
+            if not ny_access:
+                logger.error("Refresh response had no access_token. Keeping existing tokens.")
+                return False
+
             # Update the tokens
-            self.access_token = tokens.get('access_token')
-            if 'refresh_token' in tokens:
-                # null eller tom streng betyr "ingen refresh-token", aldri ""
-                self.refresh_token = tokens.get('refresh_token') or None
+            self.access_token = ny_access
+            # Et OAuth-svar er IKKE tokenfila: manglende, null eller tom
+            # refresh_token betyr at serveren ikke roterte. Behold da den
+            # gamle (samme som dashbordet, ticktick-token.mjs).
+            ny_refresh = normaliser_refresh_token(tokens.get('refresh_token'))
+            if ny_refresh:
+                self.refresh_token = ny_refresh
 
             # Update the headers
             self.headers["Authorization"] = f"Bearer {self.access_token}"
@@ -132,9 +191,11 @@ class TickTickClient:
         
         # Update with new tokens
         env_content["TICKTICK_ACCESS_TOKEN"] = tokens.get('access_token', '')
-        if 'refresh_token' in tokens:
-            # Et eksplisitt null skal aldri bli strengen "None" i .env
-            env_content["TICKTICK_REFRESH_TOKEN"] = tokens.get('refresh_token') or ''
+        # Bare en faktisk rotert refresh-token skrives: null/tom lar den
+        # eksisterende stå, og "None" kan aldri havne i .env
+        ny_refresh = normaliser_refresh_token(tokens.get('refresh_token'))
+        if ny_refresh:
+            env_content["TICKTICK_REFRESH_TOKEN"] = ny_refresh
         
         # Make sure client credentials are saved as well
         if self.client_id and "TICKTICK_CLIENT_ID" not in env_content:
@@ -152,21 +213,23 @@ class TickTickClient:
     @staticmethod
     def _refresh_fra_fil(shared: Dict, fallback: Optional[str]) -> Optional[str]:
         """
-        Velg refresh_token naar den delte tokenfila er lest (har access_token).
+        Velg refresh_token naar den delte TOKENFILA er lest (har access_token).
 
         Har fila noekkelen `refresh_token`, er den autoritativ: en streng
-        brukes, null (eller tom streng) gir None uten fallback. Mangler
+        brukes, null (eller tom streng) gir None uten fallback (ticktick-auth.mjs
+        skriver null med vilje naar TickTick ikke ga refresh-token). Mangler
         noekkelen, brukes fallback (miljoe/.env/minne) som for.
 
-        Kjent forskjell mot dashbordet (ticktick-token.mjs, ikke rettet her):
-        dashbordet har ingen fallback ved manglende noekkel (overtar hele
-        filobjektet), beholder gammel verdi ved null/tom streng i et
-        OAuth-svar (Python erstatter den med None), og adopterer bare ved
-        endret access_token eller nyere tidsstempel (Python overtar
-        refresh-verdien alltid etter 401). Harmonisering er egen endring.
+        Dette gjelder KUN tokenfila. Et OAuth-svar paa en fornyelse er noe
+        annet: der betyr manglende/null/tom refresh_token "ikke rotert", og den
+        gamle beholdes (se _refresh_access_token, samme som dashbordet).
+
+        Kjent forskjell mot dashbordet (ticktick-token.mjs), bevisst ikke rettet
+        her: dashbordet har ingen fallback ved manglende noekkel (overtar hele
+        filobjektet). Harmonisering er egen endring.
         """
         if "refresh_token" in shared:
-            return shared["refresh_token"] or None
+            return normaliser_refresh_token(shared["refresh_token"])
         return fallback
 
     def _read_token_file(self) -> Optional[Dict]:
@@ -174,27 +237,38 @@ class TickTickClient:
         try:
             if TOKEN_FILE.exists():
                 data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    logger.warning("Shared token file is not a JSON object. Ignoring it.")
+                    return None
                 if data.get("access_token"):
                     return data
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, ValueError) as e:
+            # ValueError dekker baade JSONDecodeError og UnicodeDecodeError
             logger.warning(f"Could not read shared token file: {e}")
         return None
 
     def _write_token_file(self) -> None:
         """Skriv gjeldende tokens til den delte fila (atomisk via tmp+replace)."""
-        try:
-            TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "access_token": self.access_token,
-                "refresh_token": self.refresh_token,
-                "oppdatert": datetime.now(timezone.utc).isoformat(),
-                "kilde": "python-refresh",
-            }
-            tmp = TOKEN_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            tmp.replace(TOKEN_FILE)
-        except OSError as e:
-            logger.warning(f"Could not write shared token file: {e}")
+        tid = datetime.now(timezone.utc)
+        # Sett tidsstempelet ogsaa ved mislykket skriving: minnet er da nyere
+        # enn fila, og en eldre fil skal ikke adopteres etter en senere 401
+        self._fil_oppdatert = tid
+        skriv_token_fil(self.access_token, self.refresh_token, "python-refresh", tid)
+
+    def _filen_er_nyere(self, shared: Dict) -> bool:
+        """
+        Er den delte fila nyere enn det klienten sist leste eller skrev?
+        Samme prinsipp som dashbordet (ticktick-token.mjs, funn 9): ulik
+        access_token, eller nyere `oppdatert`. Har begge tidsstempel, vinner
+        tidsstempelet (en eldre fil adopteres ikke selv om access_token er ulik).
+        """
+        fil_tid = _parse_tid(shared.get("oppdatert"))
+        if fil_tid and self._fil_oppdatert:
+            if fil_tid < self._fil_oppdatert:
+                return False
+            if fil_tid > self._fil_oppdatert:
+                return True
+        return shared["access_token"] != self.access_token
 
     def _send(self, method: str, url: str, data=None):
         """Send ett HTTP-kall med gjeldende headers."""
@@ -227,9 +301,11 @@ class TickTickClient:
                 # Node-serveren kan alt ha fornyet tokenet - les delt fil
                 # foer vi brenner vaar egen refresh (refresh_token roterer)
                 shared = self._read_token_file()
-                if shared and shared.get("access_token"):
-                    # Fila er autoritativ for refresh_token, ogsaa naar den er null
+                if shared and shared.get("access_token") and self._filen_er_nyere(shared):
+                    # Fila er autoritativ for refresh_token, ogsaa naar den er null,
+                    # men bare naar den faktisk er nyere enn vaar tilstand
                     self.refresh_token = self._refresh_fra_fil(shared, self.refresh_token)
+                    self._fil_oppdatert = _parse_tid(shared.get("oppdatert")) or self._fil_oppdatert
                     if shared["access_token"] != self.access_token:
                         logger.info("Using refreshed token from shared token file.")
                         self.access_token = shared["access_token"]
