@@ -67,9 +67,11 @@ class TestTokenFilForrang(unittest.TestCase):
         }):
             with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE") as mock_path:
                 mock_path.exists.return_value = True
-                mock_path.read_text.return_value = token_data
+                mock_path.open = mock_open(read_data=token_data)
 
-                with patch("ticktick_mcp.src.ticktick_client.load_dotenv"):
+                with patch("ticktick_mcp.src.ticktick_client.load_dotenv"), \
+                        patch("ticktick_mcp.src.ticktick_client.os.fstat") as stat:
+                    stat.return_value.st_mtime_ns = 100
                     from ticktick_mcp.src.ticktick_client import TickTickClient
                     klient = TickTickClient()
 
@@ -78,8 +80,8 @@ class TestTokenFilForrang(unittest.TestCase):
         self.assertEqual(klient.refresh_token, "refresh-fra-fil",
                          "refresh_token skal komme fra tokens.json, ikke .env")
 
-    def test_tom_token_fil_faller_tilbake_paa_env(self):
-        """Når tokens.json mangler access_token, beholdes .env-verdien."""
+    def test_tom_token_fil_gir_ikke_env_fallback(self):
+        """En eksisterende ugyldig fil gir ikke fallback til gamle miljøverdier."""
         token_data = json.dumps({"access_token": "", "refresh_token": ""})
 
         with patch.dict("os.environ", {
@@ -90,14 +92,13 @@ class TestTokenFilForrang(unittest.TestCase):
         }):
             with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE") as mock_path:
                 mock_path.exists.return_value = True
-                mock_path.read_text.return_value = token_data
+                mock_path.open = mock_open(read_data=token_data)
 
-                with patch("ticktick_mcp.src.ticktick_client.load_dotenv"):
+                with patch("ticktick_mcp.src.ticktick_client.load_dotenv"), \
+                        patch("ticktick_mcp.src.ticktick_client.os.fstat"):
                     from ticktick_mcp.src.ticktick_client import TickTickClient
-                    klient = TickTickClient()
-
-        self.assertEqual(klient.access_token, "token-fra-env",
-                         "Når tokens.json har tom access_token, skal .env-verdien beholdes")
+                    with self.assertRaises(ValueError):
+                        TickTickClient()
 
     def test_manglende_token_fil_faller_tilbake_paa_env(self):
         """Når tokens.json ikke finnes, beholdes .env-verdien."""
@@ -130,8 +131,9 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.fil = Path(self._tmp.name) / "tokens.json"
 
-    def _skriv(self, data):
+    def _skriv(self, data, mtime_ns=200):
         self.fil.write_text(json.dumps(data), encoding="utf-8")
+        os.utime(self.fil, ns=(mtime_ns, mtime_ns))
 
     def _opprett_klient(self, env=None):
         miljo = {
@@ -155,10 +157,10 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
         self.assertIsNone(klient.refresh_token,
                           "null i fila skal gi None, ikke gammel miljoeverdi")
 
-    def test_fil_uten_noekkel_faller_tilbake_paa_miljo(self):
+    def test_fil_uten_noekkel_henter_ikke_gammel_miljoverdi(self):
         self._skriv({"access_token": "TEST-access-fil"})
         klient = self._opprett_klient()
-        self.assertEqual(klient.refresh_token, "TEST-refresh-env")
+        self.assertIsNone(klient.refresh_token)
 
     def test_fil_med_streng_brukes(self):
         self._skriv({"access_token": "TEST-access-fil", "refresh_token": "TEST-refresh-fil"})
@@ -169,11 +171,10 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
         klient = self._opprett_klient()  # self.fil finnes ikke
         self.assertEqual(klient.refresh_token, "TEST-refresh-env")
 
-    def test_fil_uten_access_token_er_ikke_autoritativ(self):
+    def test_fil_uten_access_token_gir_ikke_env_fallback(self):
         self._skriv({"access_token": "", "refresh_token": None})
-        klient = self._opprett_klient()
-        self.assertEqual(klient.access_token, "TEST-access-env")
-        self.assertEqual(klient.refresh_token, "TEST-refresh-env")
+        with self.assertRaises(ValueError):
+            self._opprett_klient()
 
     def _respons(self, status_code):
         mock = MagicMock()
@@ -207,33 +208,31 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
             resultat = klient._make_request("GET", "/project")
         return resultat, post
 
-    def test_401_nyere_fil_med_samme_access_og_null_nuller_ikke_gyldig_refresh(self):
-        """CR 7: null fra fila overstyrer bare naar access_token ogsaa adopteres."""
+    def test_401_nyere_fil_med_samme_access_uten_refresh_nuller_minneverdi(self):
+        """Hele nyere filversjonen gjelder, også med uendret access_token."""
         naa = datetime.now(timezone.utc)
         for fil_refresh in ({"refresh_token": None}, {"refresh_token": ""}, {}):
             with self.subTest(fil_refresh=fil_refresh):
                 klient = _lag_klient_direkte(access_token="TEST-samme",
                                              refresh_token="TEST-gyldig-refresh",
-                                             _fil_oppdatert=naa - timedelta(minutes=5))
+                                             _fil_mtime_ns=100)
                 _, post = self._401_med_fil(klient, {
                     "access_token": "TEST-samme", "oppdatert": naa.isoformat(), **fil_refresh})
-                self.assertEqual(klient.refresh_token, "TEST-gyldig-refresh")
-                post.assert_called_once()  # egen refresh med det gyldige tokenet
-                self.assertEqual(post.call_args.kwargs["data"]["refresh_token"],
-                                 "TEST-gyldig-refresh")
-                self.assertEqual(klient._fil_oppdatert, naa)
+                self.assertIsNone(klient.refresh_token)
+                post.assert_not_called()
+                self.assertEqual(klient._fil_mtime_ns, 200)
 
     def test_401_nyere_fil_med_samme_access_og_ny_refresh_streng_adopteres(self):
         naa = datetime.now(timezone.utc)
         klient = _lag_klient_direkte(access_token="TEST-samme", refresh_token="TEST-gammel",
-                                     _fil_oppdatert=naa - timedelta(minutes=5))
+                                     _fil_mtime_ns=100)
         self._401_med_fil(klient, {"access_token": "TEST-samme",
                                    "refresh_token": "TEST-rotert-av-node",
                                    "oppdatert": naa.isoformat()})
         self.assertEqual(klient.refresh_token, "TEST-rotert-av-node")
 
-    def test_401_adopsjon_uten_refresh_noekkel_i_fil_beholder_minneverdi(self):
-        """Ny access_token adopteres, men mangler nøkkelen beholdes refresh fra minnet."""
+    def test_401_adopsjon_uten_refresh_noekkel_i_fil_nuller_minneverdi(self):
+        """Manglende refresh_token i en adoptert fil betyr ingen refresh-token."""
         klient = _lag_klient_direkte(access_token="TEST-gammel-access",
                                      refresh_token="TEST-minne-refresh")
         self._skriv({"access_token": "TEST-ny-access"})
@@ -241,16 +240,16 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
         with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", self.fil):
             klient._make_request("GET", "/project")
         self.assertEqual(klient.access_token, "TEST-ny-access")
-        self.assertEqual(klient.refresh_token, "TEST-minne-refresh")
+        self.assertIsNone(klient.refresh_token)
 
-    def test_401_fil_med_samme_access_og_uten_nyere_tidsstempel_adopteres_ikke(self):
+    def test_401_fil_med_samme_access_og_uendret_mtime_adopteres_ikke(self):
         """Funn 4: en fil som ikke er nyere skal ikke nullstille refresh-tokenen i minnet."""
         naa = datetime.now(timezone.utc)
-        for oppdatert in (None, (naa - timedelta(minutes=5)).isoformat(), naa.isoformat()):
+        for oppdatert in (None, "2000-01-01T00:00:00Z", "2099-01-01T00:00:00Z"):
             with self.subTest(oppdatert=oppdatert):
                 klient = _lag_klient_direkte(access_token="TEST-samme",
                                              refresh_token="TEST-gammel-refresh",
-                                             _fil_oppdatert=naa)
+                                             _fil_mtime_ns=200)
                 fil = {"access_token": "TEST-samme", "refresh_token": None}
                 if oppdatert:
                     fil["oppdatert"] = oppdatert
@@ -271,7 +270,7 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
     def test_401_eldre_fil_med_annen_access_adopteres_ikke(self):
         naa = datetime.now(timezone.utc)
         klient = _lag_klient_direkte(access_token="TEST-ny-i-minnet",
-                                     refresh_token="TEST-rotert-refresh", _fil_oppdatert=naa)
+                                     refresh_token="TEST-rotert-refresh", _fil_mtime_ns=300)
         resultat, post = self._401_med_fil(klient, {
             "access_token": "TEST-gammel-i-fil", "refresh_token": "TEST-doed-refresh",
             "oppdatert": (naa - timedelta(hours=1)).isoformat()})
@@ -391,8 +390,9 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
         eldre fil adopteres ikke etter en senere 401."""
         self.fil.write_text(json.dumps({
             "access_token": "TEST-access-gammel", "refresh_token": "TEST-refresh-gammel",
-            "oppdatert": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            "oppdatert": "2099-01-01T00:00:00Z",
         }), encoding="utf-8")
+        os.utime(self.fil, ns=(100, 100))
         klient = self._ny_klient()
         respons = MagicMock()
         respons.raise_for_status.return_value = None
@@ -404,13 +404,14 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
         self.assertEqual(klient.refresh_token, "TEST-refresh-rotert")
         self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-gammel", "fila er uendret")
 
-        # Senere 401: den gamle fila (ulik access_token, eldre tidsstempel) skal ikke adopteres
+        # Senere 401: uendret mtime avviser gammel fil, selv med oppdatert i framtiden.
         klient._send = MagicMock(side_effect=[self._respons_401(), self._respons_401()])
         with patch("ticktick_mcp.src.ticktick_client.requests.post") as post:
             klient._make_request("GET", "/project")
         self.assertEqual(klient.access_token, "TEST-access-ny")
         self.assertEqual(klient.refresh_token, "TEST-refresh-rotert")
         self.assertEqual(post.call_args.kwargs["data"]["refresh_token"], "TEST-refresh-rotert")
+        self.assertEqual(klient._fil_mtime_ns, 100)
 
     @staticmethod
     def _respons_401():
@@ -419,14 +420,13 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
         mock.raise_for_status.side_effect = HTTPError(response=mock)
         return mock
 
-    def test_korrupt_fil_faller_tilbake_som_ved_manglende_fil(self):
+    def test_korrupt_fil_gir_ikke_env_fallback(self):
         """Funn 7: JSON-rot som ikke er et objekt, ugyldig JSON og ugyldig UTF-8."""
         for innhold in (b"[]", b"null", b"\"tekst\"", b"42", b"{ikke json", b"\xff\xfe\x00\xd8"):
             with self.subTest(innhold=innhold):
                 self.fil.write_bytes(innhold)
-                klient = self._ny_klient()  # skal ikke kaste
-                self.assertEqual(klient.access_token, "TEST-access-env")
-                self.assertEqual(klient.refresh_token, "TEST-refresh-env")
+                with self.assertRaises(ValueError):
+                    self._ny_klient()
 
     def test_env_skrivefeil_hindrer_ikke_tokenfila_eller_tidsstempel(self):
         """Astra 2 / CR 1: tokenfila skrives FOERST, og en feil i .env svelges verdifritt."""
@@ -441,7 +441,7 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
             self.assertTrue(klient._refresh_access_token())
         self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-rotert")
         self.assertEqual(self._fil()["access_token"], "TEST-access-ny")
-        self.assertIsNotNone(klient._fil_oppdatert)
+        self.assertEqual(klient._fil_mtime_ns, self.fil.stat().st_mtime_ns)
         self.assertEqual(klient.refresh_token, "TEST-refresh-rotert")
         self.assertNotIn("TEST-", "\n".join(logg.output), "ingen tokenverdier i loggen")
 
@@ -451,9 +451,8 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
             with self.subTest(verdi=verdi):
                 self.fil.write_text(json.dumps(
                     {"access_token": verdi, "refresh_token": "TEST-r"}), encoding="utf-8")
-                klient = self._ny_klient()
-                self.assertEqual(klient.access_token, "TEST-access-env")
-                self.assertEqual(klient.refresh_token, "TEST-refresh-env")
+                with self.assertRaises(ValueError):
+                    self._ny_klient()
 
     def test_korrupt_fil_etter_401_kaster_ikke(self):
         klient = self._ny_klient()
@@ -481,6 +480,8 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
         klient = self._ny_klient()
         self.fil.write_text(json.dumps(
             {"access_token": "TEST-access-ny", "refresh_token": ""}), encoding="utf-8")
+        nyere = klient._fil_mtime_ns + 1_000_000_000
+        os.utime(self.fil, ns=(nyere, nyere))
         respons_401 = MagicMock(status_code=401)
         respons_ok = MagicMock(status_code=200, text="{}")
         respons_ok.json.return_value = {}
@@ -533,10 +534,11 @@ class TestAuthSkriverTokenfilOgEnv(unittest.TestCase):
         self.assertEqual(data["refresh_token"], "TEST-r")
 
     def test_ny_innlogging_via_auth_faar_effekt_ved_klientoppstart(self):
-        """Funn 3: fila vinner over .env, saa auth maa skrive den for at innloggingen skal virke."""
+        """Simulert innlogging skriver fila som vinner over motstridende miljø."""
         from ticktick_mcp.src.auth import TickTickAuth
         from ticktick_mcp.src.ticktick_client import TickTickClient
-        with patch.dict("os.environ", {}, clear=True), \
+        with patch.dict("os.environ", {"TICKTICK_ACCESS_TOKEN": "TEST-env-gammel",
+                                       "TICKTICK_REFRESH_TOKEN": "TEST-env-gammel-refresh"}, clear=True), \
                 patch("ticktick_mcp.src.auth.load_dotenv"), \
                 patch("ticktick_mcp.src.ticktick_client.load_dotenv"), \
                 i_tom_mappe() as mappe:
@@ -544,9 +546,16 @@ class TestAuthSkriverTokenfilOgEnv(unittest.TestCase):
             fil.write_text(json.dumps({"access_token": "TEST-utgaatt",
                                        "refresh_token": None}), encoding="utf-8")
             auth = TickTickAuth(client_id="TEST-cid", client_secret="TEST-csecret")
-            auth.tokens = {"access_token": "TEST-ny-innlogging", "refresh_token": "TEST-ny-refresh"}
-            with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", fil):
-                auth._save_tokens_to_env()
+            auth.auth_code = "TEST-innloggingskode"
+            respons = MagicMock()
+            respons.json.return_value = {"access_token": "TEST-ny-innlogging",
+                                         "refresh_token": "TEST-ny-refresh"}
+            with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", fil), \
+                    patch("ticktick_mcp.src.auth.requests.post", return_value=respons) as post:
+                melding = auth.exchange_code_for_token()
+                self.assertIn("successful", melding.lower())
+                post.assert_called_once()
+                self.assertEqual(post.call_args.kwargs["data"]["grant_type"], "authorization_code")
                 klient = TickTickClient()
         self.assertEqual(klient.access_token, "TEST-ny-innlogging")
         self.assertEqual(klient.refresh_token, "TEST-ny-refresh")
@@ -563,43 +572,68 @@ class TestNormaliserRefreshToken(unittest.TestCase):
 
 
 class TestFilenErNyere(unittest.TestCase):
-    """HOEY (Astra 1): har klienten et kjent tidspunkt, kreves strengt nyere, gyldig filtidspunkt."""
+    """Filens mtime styrer adopsjon. Skriverens oppdatert er kun informasjon."""
 
-    T = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
+    def test_kjent_mtime_krever_strengt_nyere(self):
+        klient = _lag_klient_direkte(_fil_mtime_ns=200)
+        for mtime_ns in (None, 100, 200):
+            self.assertFalse(klient._filen_er_nyere({
+                "access_token": "TEST-annen", "_mtime_ns": mtime_ns,
+                "oppdatert": "2099-01-01T00:00:00Z"}))
+        self.assertTrue(klient._filen_er_nyere({
+            "access_token": "TEST-annen", "_mtime_ns": 300,
+            "oppdatert": "2000-01-01T00:00:00Z"}))
 
-    def _klient(self, tid, access="TEST-a"):
-        return _lag_klient_direkte(access_token=access, _fil_oppdatert=tid)
+    def test_foerste_filversjon_overtas_ogsaa_med_samme_access(self):
+        klient = _lag_klient_direkte(access_token="TEST-a")
+        self.assertTrue(klient._filen_er_nyere({"access_token": "TEST-a", "_mtime_ns": 100}))
 
-    def test_kjent_tidspunkt_avviser_like_manglende_og_ugyldige(self):
-        klient = self._klient(self.T)
-        for oppdatert in ("2026-09-29T12:00:00Z",        # likt
-                          "2026-09-29T14:00:00+02:00",   # likt uttrykt i annen sone
-                          "2026-09-29T13:30:00+02:00",   # 11:30Z, eldre
-                          "2026-09-29T11:00:00Z",        # eldre
-                          None, "", "ikke-en-dato", 12345, ["x"]):
-            with self.subTest(oppdatert=oppdatert):
-                fil = {"access_token": "TEST-annen"}   # ulik access_token skal IKKE hjelpe
-                if oppdatert is not None:
-                    fil["oppdatert"] = oppdatert
-                self.assertFalse(klient._filen_er_nyere(fil))
+    def test_nyere_fil_overtas_selv_om_oppdatert_gaar_bakover(self):
+        from ticktick_mcp.src.ticktick_client import TickTickClient
+        with i_tom_mappe() as mappe, \
+                patch("ticktick_mcp.src.ticktick_client.load_dotenv"), \
+                patch.dict("os.environ", {}, clear=True):
+            fil = Path(mappe) / "tokens.json"
+            fil.write_text(json.dumps({"access_token": "TEST-gammel",
+                                      "refresh_token": "TEST-refresh-gammel",
+                                      "oppdatert": "2099-01-01T00:00:00Z"}), encoding="utf-8")
+            os.utime(fil, ns=(100, 100))
+            with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", fil):
+                klient = TickTickClient()
+                fil.write_text(json.dumps({"access_token": "TEST-ny",
+                                          "oppdatert": "2000-01-01T00:00:00Z"}), encoding="utf-8")
+                os.utime(fil, ns=(200, 200))
+                respons = MagicMock(status_code=200, text="{}")
+                respons.json.return_value = {}
+                klient._send = MagicMock(side_effect=[MagicMock(status_code=401), respons])
+                klient._refresh_access_token = MagicMock()
+                klient._make_request("GET", "/project")
+                self.assertEqual(klient.access_token, "TEST-ny")
+                self.assertIsNone(klient.refresh_token)
+                self.assertEqual(klient._fil_mtime_ns, 200)
+                klient._refresh_access_token.assert_not_called()
 
-    def test_kjent_tidspunkt_godtar_strengt_nyere_ogsaa_med_samme_access(self):
-        klient = self._klient(self.T)
-        for oppdatert in ("2026-09-29T12:00:00.001Z", "2026-09-29T14:30:00+02:00",
-                          "2026-09-29T12:01:00", "2026-09-29T12:00:01+00:00"):
-            for access in ("TEST-a", "TEST-annen"):
-                with self.subTest(oppdatert=oppdatert, access=access):
-                    self.assertTrue(klient._filen_er_nyere(
-                        {"access_token": access, "oppdatert": oppdatert}))
-
-    def test_uten_kjent_tidspunkt_brukes_ulik_access_token(self):
-        klient = self._klient(None)
-        self.assertTrue(klient._filen_er_nyere({"access_token": "TEST-annen"}))
-        self.assertTrue(klient._filen_er_nyere(
-            {"access_token": "TEST-annen", "oppdatert": "ikke-en-dato"}))
-        self.assertFalse(klient._filen_er_nyere({"access_token": "TEST-a"}))
-        self.assertFalse(klient._filen_er_nyere(
-            {"access_token": "TEST-a", "oppdatert": "2026-09-29T12:00:00Z"}))
+    def test_framtidig_oppdatert_med_uendret_mtime_overtas_ikke(self):
+        from ticktick_mcp.src.ticktick_client import TickTickClient
+        with i_tom_mappe() as mappe, \
+                patch("ticktick_mcp.src.ticktick_client.load_dotenv"), \
+                patch.dict("os.environ", {}, clear=True):
+            fil = Path(mappe) / "tokens.json"
+            fil.write_text(json.dumps({"access_token": "TEST-opprinnelig",
+                                      "refresh_token": "TEST-refresh",
+                                      "oppdatert": "2000-01-01T00:00:00Z"}), encoding="utf-8")
+            os.utime(fil, ns=(100, 100))
+            with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", fil):
+                klient = TickTickClient()
+                fil.write_text(json.dumps({"access_token": "TEST-fremtid",
+                                          "oppdatert": "2099-01-01T00:00:00Z"}), encoding="utf-8")
+                os.utime(fil, ns=(100, 100))
+                klient._send = MagicMock(return_value=MagicMock(status_code=401))
+                klient._refresh_access_token = MagicMock(return_value=False)
+                klient._make_request("GET", "/project")
+                self.assertEqual(klient.access_token, "TEST-opprinnelig")
+                self.assertEqual(klient.refresh_token, "TEST-refresh")
+                klient._refresh_access_token.assert_called_once()
 
 
 class TestSkrivTokenFil(unittest.TestCase):
@@ -804,6 +838,7 @@ class TestRefreshVed401(unittest.TestCase):
         klient._read_token_file = MagicMock(return_value={
             "access_token": "nytt-token-fra-fil",
             "refresh_token": "refresh-fra-fil",
+            "_mtime_ns": 100,
         })
         klient._refresh_access_token = MagicMock(return_value=True)
         klient._send = MagicMock(side_effect=[respons_401, respons_ok])

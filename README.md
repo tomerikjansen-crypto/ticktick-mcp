@@ -54,7 +54,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for Ti
    This will:
    - Ask for your TickTick Client ID and Client Secret
    - Open a browser window for you to log in to TickTick
-   - Automatically save your access tokens to a `.env` file
+   - Lagre tilgangsnøklene atomisk i `~/.ticktick/tokens.json`, med en kopi i `.env`
 
 4. **Test your configuration**:
    ```bash
@@ -79,9 +79,13 @@ This server uses OAuth2 to authenticate with TickTick. The setup process is stra
 
 4. A browser window will open for you to authorize the application with your TickTick account
 
-5. After authorizing, you'll be redirected back to the application, and your access tokens will be automatically saved to the `.env` file
+5. Etter godkjenning sendes du tilbake til programmet. Tilgangsnøklene lagres automatisk i den delte tokenfila `~/.ticktick/tokens.json`, med en kopi i `.env`.
 
-The server handles token refresh automatically, so you won't need to reauthenticate unless you revoke access or delete your `.env` file.
+Serveren fornyer tilgangsnøkkelen automatisk når et gyldig refresh-token finnes. Hvis fornyelse ikke lenger er mulig, må du logge inn på nytt.
+
+Python-klienten, dashbordet og innloggingsskriptene følger samme regel: miljøverdier fra prosessen eller `.env` brukes bare ved første oppstart når tokenfila ikke finnes. Deretter er den delte tokenfila autoritativ. En eksisterende ugyldig fil gir ikke fallback til miljøverdier. Hele filinnholdet gjelder: manglende `refresh_token`, eksplisitt `null` eller tom streng betyr at ingen refresh-token finnes, også når en kjørende klient overtar fila. Et svar fra selve tokenfornyelsen behandles annerledes: manglende, null eller tom refresh-token betyr at den tidligere verdien beholdes.
+
+Ved gjenlesing før fornyelse overtas bare en fil med strengt nyere endringstid (`mtime`) enn den sist observerte filversjonen. Feltet `oppdatert` er kun informasjon og avgjør ikke kildevalget. Hvis lokal fornyelse lykkes, men filskrivingen feiler, beholdes den nye nøkkelen i minnet og den observerte gamle diskversjonen overtas ikke. Innlogging og fornyelse skriver tokenfila atomisk.
 
 ## Authentication with Dida365
 
@@ -237,7 +241,7 @@ The project implements a complete OAuth 2.0 flow for TickTick:
 2. **Browser Authorization**: User is redirected to TickTick to grant access
 3. **Token Reception**: A local server receives the OAuth callback with the authorization code
 4. **Token Exchange**: The code is exchanged for access and refresh tokens
-5. **Token Storage**: Tokens are securely stored in the local `.env` file
+5. **Token Storage**: Den delte `~/.ticktick/tokens.json` er autoritativ; `.env` er bare kilde ved første oppstart uten tokenfil.
 6. **Token Refresh**: The client automatically refreshes the access token when it expires
 
 This simplifies the user experience by handling the entire OAuth flow programmatically.

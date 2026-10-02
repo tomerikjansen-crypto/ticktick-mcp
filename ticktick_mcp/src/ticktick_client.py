@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 # Delt tokenfil med dashboard-serverens Node-tokenmodul (prosjektering-repoet,
 # fase 2 K5): ett token-system paa tvers av Python og Node.
+# Miljoe/.env brukes bare naar tokenfila ikke finnes. Deretter er hele fila
+# autoritativ, ogsaa manglende/null refresh_token. Nyere fil avgjoeres av mtime,
+# aldri av oppdatert (kun informasjon). Innlogging og fornyelse skriver atomisk.
 TOKEN_FILE = Path.home() / ".ticktick" / "tokens.json"
 
 
@@ -22,17 +25,6 @@ def normaliser_refresh_token(verdi: Any) -> Optional[str]:
     if isinstance(verdi, str) and verdi.strip():
         return verdi
     return None
-
-
-def _parse_tid(verdi: Any) -> Optional[datetime]:
-    """Tolk en ISO-tidsstempel (Python +00:00 eller JS Z). None ved feil."""
-    if not isinstance(verdi, str) or not verdi:
-        return None
-    try:
-        tid = datetime.fromisoformat(verdi.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return tid if tid.tzinfo else tid.replace(tzinfo=timezone.utc)
 
 
 def skriv_token_fil(access_token: str, refresh_token: Optional[str], kilde: str,
@@ -86,26 +78,26 @@ class TickTickClient:
     Client for the TickTick API using OAuth2 authentication.
     """
 
-    # Tidsstempel for siste tokenfil klienten leste eller skrev (adopsjon etter 401)
-    _fil_oppdatert: Optional[datetime] = None
+    # mtime for siste observerte diskversjon, ogsaa ved mislykket lagring.
+    _fil_mtime_ns: Optional[int] = None
 
     def __init__(self):
         load_dotenv()
         self.client_id = os.getenv("TICKTICK_CLIENT_ID")
         self.client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
-        self.access_token = os.getenv("TICKTICK_ACCESS_TOKEN")
-        self.refresh_token = os.getenv("TICKTICK_REFRESH_TOKEN")
+        self.access_token = None
+        self.refresh_token = None
 
-        # Delt tokenfil (skrives av dashboard-serverens token-modul) har
-        # forrang over .env: ett token-system paa tvers av Node og Python (K5)
+        # En eksisterende, men uleselig/ugyldig fil gir ikke miljoefallback.
+        finnes = TOKEN_FILE.exists()
         shared = self._read_token_file()
         if shared:
-            self.access_token = shared.get("access_token") or self.access_token
-            # Fila er autoritativ for refresh_token, ogsaa naar verdien er
-            # eksplisitt null (ingen refresh-token utstedt, ny innlogging
-            # kreves). Da skal en gammel verdi fra miljoe/.env IKKE brukes.
-            self.refresh_token = self._refresh_fra_fil(shared, self.refresh_token)
-            self._fil_oppdatert = _parse_tid(shared.get("oppdatert"))
+            self.access_token = shared["access_token"]
+            self.refresh_token = self._refresh_fra_fil(shared)
+            self._fil_mtime_ns = shared["_mtime_ns"]
+        elif not finnes:
+            self.access_token = os.getenv("TICKTICK_ACCESS_TOKEN")
+            self.refresh_token = normaliser_refresh_token(os.getenv("TICKTICK_REFRESH_TOKEN"))
 
         if not self.access_token:
             raise ValueError("TICKTICK_ACCESS_TOKEN environment variable is not set. "
@@ -178,8 +170,7 @@ class TickTickClient:
             # Update the headers
             self.headers["Authorization"] = f"Bearer {self.access_token}"
             
-            # Den autoritative tokenfila FOERST (den registrerer ogsaa klientens
-            # nye tidspunkt foer noe kan feile), slik at Node-serveren ser fornyelsen
+            # Den autoritative tokenfila FOERST, slik at Node ser fornyelsen.
             self._write_token_file()
 
             # .env er sekundaer lagring: en feil her skal aldri hindre resten
@@ -237,37 +228,34 @@ class TickTickClient:
         logger.debug("Tokens saved to .env file")
 
     @staticmethod
-    def _refresh_fra_fil(shared: Dict, fallback: Optional[str]) -> Optional[str]:
+    def _refresh_fra_fil(shared: Dict) -> Optional[str]:
         """
         Velg refresh_token naar den delte TOKENFILA er lest (har access_token).
 
-        Har fila noekkelen `refresh_token`, er den autoritativ: en streng
-        brukes, null (eller tom streng) gir None uten fallback (ticktick-auth.mjs
-        skriver null med vilje naar TickTick ikke ga refresh-token). Mangler
-        noekkelen, brukes fallback (miljoe/.env/minne) som for.
+        Hele fila er autoritativ: manglende noekkel, null eller tom streng gir
+        None uten fallback til miljoe/.env/minne, som i dashbordet.
 
         Dette gjelder KUN tokenfila. Et OAuth-svar paa en fornyelse er noe
         annet: der betyr manglende/null/tom refresh_token "ikke rotert", og den
         gamle beholdes (se _refresh_access_token, samme som dashbordet).
 
-        Kjent forskjell mot dashbordet (ticktick-token.mjs), bevisst ikke rettet
-        her: dashbordet har ingen fallback ved manglende noekkel (overtar hele
-        filobjektet). Harmonisering er egen endring.
         """
-        if "refresh_token" in shared:
-            return normaliser_refresh_token(shared["refresh_token"])
-        return fallback
+        return normaliser_refresh_token(shared.get("refresh_token"))
 
     def _read_token_file(self) -> Optional[Dict]:
         """Les den delte tokenfila. Returnerer None ved manglende/korrupt fil."""
         try:
             if TOKEN_FILE.exists():
-                data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+                # Samme aapne fil gir innhold og mtime selv ved atomisk replace.
+                with TOKEN_FILE.open(encoding="utf-8") as tokenfil:
+                    data = json.load(tokenfil)
+                    mtime_ns = os.fstat(tokenfil.fileno()).st_mtime_ns
                 if not isinstance(data, dict):
                     logger.warning("Shared token file is not a JSON object. Ignoring it.")
                     return None
                 token = data.get("access_token")
                 if isinstance(token, str) and token.strip():
+                    data["_mtime_ns"] = mtime_ns
                     return data
         except (OSError, ValueError) as e:
             # ValueError dekker baade JSONDecodeError og UnicodeDecodeError
@@ -276,24 +264,28 @@ class TickTickClient:
 
     def _write_token_file(self) -> None:
         """Skriv gjeldende tokens til den delte fila (atomisk via tmp+replace)."""
-        tid = datetime.now(timezone.utc)
-        # Sett tidsstempelet ogsaa ved mislykket skriving: minnet er da nyere
-        # enn fila, og en eldre fil skal ikke adopteres etter en senere 401
-        self._fil_oppdatert = tid
-        skriv_token_fil(self.access_token, self.refresh_token, "python-refresh", tid)
+        # Husk diskversjonen FOER lagring: ved feil maa den ikke erstatte
+        # tokenet som nettopp ble fornyet i minnet.
+        try:
+            mtime_ns = TOKEN_FILE.stat().st_mtime_ns
+            self._fil_mtime_ns = max(self._fil_mtime_ns or 0, mtime_ns)
+        except OSError:
+            pass
+        if skriv_token_fil(self.access_token, self.refresh_token, "python-refresh"):
+            shared = self._read_token_file()
+            if (shared and shared["access_token"] == self.access_token
+                    and self._refresh_fra_fil(shared) == self.refresh_token):
+                self._fil_mtime_ns = shared["_mtime_ns"]
 
     def _filen_er_nyere(self, shared: Dict) -> bool:
         """
         Er den delte fila nyere enn det klienten sist leste eller skrev?
-        Har klienten et kjent tidspunkt, kreves et STRENGT nyere, gyldig
-        tidspunkt i fila: like, manglende og ugyldige tidsstempel avvises, uansett
-        om access_token er ulik. Bare uten kjent tidspunkt (fersk start uten lest
-        fil) brukes ulik access_token som bevis, som dashbordet (ticktick-token.mjs).
+        Kun strengt nyere mtime teller. Oppdatert er informasjon fra skriverens
+        klokke. Uten observert filversjon overtas den foerste gyldige fila.
         """
-        if self._fil_oppdatert:
-            fil_tid = _parse_tid(shared.get("oppdatert"))
-            return bool(fil_tid and fil_tid > self._fil_oppdatert)
-        return shared["access_token"] != self.access_token
+        mtime_ns = shared.get("_mtime_ns")
+        return mtime_ns is not None and (
+            self._fil_mtime_ns is None or mtime_ns > self._fil_mtime_ns)
 
     def _send(self, method: str, url: str, data=None):
         """Send ett HTTP-kall med gjeldende headers."""
@@ -327,20 +319,15 @@ class TickTickClient:
                 # foer vi brenner vaar egen refresh (refresh_token roterer)
                 shared = self._read_token_file()
                 if shared and self._filen_er_nyere(shared):
-                    self._fil_oppdatert = _parse_tid(shared.get("oppdatert")) or self._fil_oppdatert
+                    self._fil_mtime_ns = shared["_mtime_ns"]
+                    self.refresh_token = self._refresh_fra_fil(shared)
                     if shared["access_token"] != self.access_token:
                         # Ny access_token adopteres: fila er autoritativ for
                         # refresh_token ogsaa naar den er null
                         logger.info("Using refreshed token from shared token file.")
-                        self.refresh_token = self._refresh_fra_fil(shared, self.refresh_token)
                         self.access_token = shared["access_token"]
                         self.headers["Authorization"] = f"Bearer {self.access_token}"
                         response = self._send(method, url, data)
-                    else:
-                        # Samme access_token: null/manglende i fila skal aldri nulle et
-                        # gyldig refresh-token i minnet, bare en faktisk ny streng adopteres
-                        self.refresh_token = normaliser_refresh_token(
-                            shared.get("refresh_token")) or self.refresh_token
 
             if response.status_code == 401:
                 logger.info("Access token expired. Attempting to refresh...")
