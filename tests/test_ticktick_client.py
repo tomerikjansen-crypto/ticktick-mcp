@@ -883,5 +883,94 @@ class TestRefreshVed401(unittest.TestCase):
         self.assertEqual(resultat, [{"name": "Innboks"}])
 
 
+class TestRetryVedMidlertidigeFeil(unittest.TestCase):
+    """#850: lesekall (GET) prøves på nytt med 1, 2 og 4 s pause ved 429/5xx.
+    Skrivekall (POST/DELETE) prøves ALDRI på nytt, fordi skrivingen kan ha gått
+    gjennom selv om svaret var en feil (ville gitt dubletter i TickTick)."""
+
+    def _respons(self, status_code, json_data=None):
+        mock = MagicMock()
+        mock.status_code = status_code
+        mock.text = "{}"
+        mock.json.return_value = json_data if json_data is not None else {}
+        if status_code >= 400:
+            from requests.exceptions import HTTPError
+            mock.raise_for_status.side_effect = HTTPError(response=mock)
+        else:
+            mock.raise_for_status.return_value = None
+        return mock
+
+    def _kjor(self, klient, method, *args):
+        with patch("ticktick_mcp.src.ticktick_client.time.sleep") as sleep:
+            resultat = klient._make_request(method, *args)
+        return resultat, sleep
+
+    def test_get_prøves_på_nytt_ved_500_og_lykkes(self):
+        klient = _lag_klient_direkte()
+        klient._send = MagicMock(side_effect=[
+            self._respons(500), self._respons(429), self._respons(200, {"ok": 1})])
+        resultat, sleep = self._kjor(klient, "GET", "/task/1")
+        self.assertEqual(resultat, {"ok": 1})
+        self.assertEqual(klient._send.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1, 2])
+
+    def test_get_gir_opp_etter_tre_nye_forsøk_med_pausene_1_2_4(self):
+        klient = _lag_klient_direkte()
+        klient._send = MagicMock(return_value=self._respons(503))
+        resultat, sleep = self._kjor(klient, "GET", "/project")
+        self.assertIn("error", resultat)
+        self.assertEqual(klient._send.call_count, 4)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1, 2, 4])
+
+    def test_get_prøves_på_nytt_ved_tidsavbrudd(self):
+        from requests.exceptions import ConnectionError as ReqConnectionError
+        klient = _lag_klient_direkte()
+        klient._send = MagicMock(side_effect=[
+            ReqConnectionError("brutt"), self._respons(200, {"ok": 2})])
+        resultat, sleep = self._kjor(klient, "GET", "/project")
+        self.assertEqual(resultat, {"ok": 2})
+        self.assertEqual(klient._send.call_count, 2)
+
+    def test_get_404_prøves_ikke_på_nytt(self):
+        klient = _lag_klient_direkte()
+        klient._send = MagicMock(return_value=self._respons(404))
+        resultat, sleep = self._kjor(klient, "GET", "/project/x")
+        self.assertIn("error", resultat)
+        self.assertEqual(klient._send.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_post_med_500_kalles_bare_en_gang(self):
+        """Dublettvern: en skriving med 5xx skal aldri prøves automatisk på nytt."""
+        klient = _lag_klient_direkte()
+        klient._send = MagicMock(return_value=self._respons(500))
+        resultat, sleep = self._kjor(klient, "POST", "/task", {"title": "TEST-x"})
+        self.assertIn("error", resultat)
+        self.assertEqual(klient._send.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_post_med_429_kalles_bare_en_gang(self):
+        klient = _lag_klient_direkte()
+        klient._send = MagicMock(return_value=self._respons(429))
+        resultat, sleep = self._kjor(klient, "POST", "/task", {"title": "TEST-x"})
+        self.assertIn("error", resultat)
+        self.assertEqual(klient._send.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_post_med_tidsavbrudd_kalles_bare_en_gang(self):
+        from requests.exceptions import ConnectionError as ReqConnectionError
+        klient = _lag_klient_direkte()
+        klient._send = MagicMock(side_effect=ReqConnectionError("brutt"))
+        resultat, sleep = self._kjor(klient, "POST", "/task", {"title": "TEST-x"})
+        self.assertIn("error", resultat)
+        self.assertEqual(klient._send.call_count, 1)
+
+    def test_delete_med_500_kalles_bare_en_gang(self):
+        klient = _lag_klient_direkte()
+        klient._send = MagicMock(return_value=self._respons(500))
+        resultat, sleep = self._kjor(klient, "DELETE", "/project/x/task/y")
+        self.assertIn("error", resultat)
+        self.assertEqual(klient._send.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -70,5 +70,63 @@ class TestFilterOutput(unittest.TestCase):
         )
 
 
+class TestUlesteLister(unittest.TestCase):
+    """#850: lister som ikke kunne leses skal meldes øverst i svaret, og et svar
+    der alle lister feilet skal ikke se ut som «ingen oppgaver»."""
+
+    def setUp(self):
+        from ticktick_mcp.src import server as modul
+        self.modul = modul
+        self.prosjekter = [
+            _prosjekt("p1", "Liste A"),
+            _prosjekt("p2", "Liste B"),
+            _prosjekt("p3", "Liste C"),
+            _prosjekt("p4", "Lukket", closed=True),
+        ]
+
+    def _kjor(self, data, filter_func=lambda t: True):
+        klient = MagicMock()
+        klient.get_project_with_data.side_effect = lambda pid: data[pid]
+        with patch.object(self.modul, "ticktick", klient):
+            return self.modul._get_project_tasks_by_filter(self.prosjekter, filter_func, "x")
+
+    def test_delvis_feil_gir_varsel_øverst_og_beholder_treff(self):
+        res = self._kjor({
+            "p1": {"tasks": [_oppgave("a")]},
+            "p2": {"error": "500 Server Error"},
+            "p3": {"error": "429"},
+        })
+        self.assertTrue(res.startswith("ADVARSEL: 2 av 3 lister kunne ikke leses"), res[:120])
+        self.assertIn("Liste B", res.split("\n")[0])
+        self.assertIn("Liste A", res)
+
+    def test_delvis_feil_uten_treff_viser_varsel_og_ikke_bare_null_oppgaver(self):
+        res = self._kjor({
+            "p1": {"tasks": []},
+            "p2": {"error": "500"},
+            "p3": {"tasks": []},
+        }, lambda t: False)
+        self.assertTrue(res.startswith("ADVARSEL: 1 av 3 lister kunne ikke leses"))
+        self.assertIn("0 tasks matching 'x'", res)
+
+    def test_alle_lister_feilet_ser_ikke_ut_som_ingen_oppgaver(self):
+        res = self._kjor({
+            "p1": {"error": "500"},
+            "p2": {"error": "500"},
+            "p3": {"error": "500"},
+        })
+        self.assertIn("3 av 3 lister kunne ikke leses", res)
+        self.assertNotIn("0 tasks matching", res)
+        self.assertIn("IKKE", res)
+
+    def test_ingen_feil_gir_ingen_varsel(self):
+        res = self._kjor({
+            "p1": {"tasks": [_oppgave("a")]},
+            "p2": {"tasks": []},
+            "p3": {"tasks": []},
+        })
+        self.assertNotIn("kunne ikke leses", res)
+
+
 if __name__ == "__main__":
     unittest.main()

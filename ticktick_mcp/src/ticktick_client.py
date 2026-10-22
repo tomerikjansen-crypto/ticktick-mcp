@@ -4,6 +4,7 @@ import base64
 import requests
 import logging
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 # autoritativ, ogsaa manglende/null refresh_token. Nyere fil avgjoeres av mtime,
 # aldri av oppdatert (kun informasjon). Innlogging og fornyelse skriver atomisk.
 TOKEN_FILE = Path.home() / ".ticktick" / "tokens.json"
+
+# #850: pauser mellom forsøk på lesekall (GET) ved midlertidige feil
+RETRY_PAUSER_SEKUNDER = (1, 2, 4)
+RETRY_STATUSKODER = (429, 500, 502, 503, 504)
 
 
 def normaliser_refresh_token(verdi: Any) -> Optional[str]:
@@ -297,22 +302,54 @@ class TickTickClient:
             return requests.delete(url, headers=self.headers)
         raise ValueError(f"Unsupported HTTP method: {method}")
 
+    def _send_med_retry(self, method: str, url: str, data=None):
+        """
+        Sender kallet. KUN lesekall (GET) prøves på nytt, ved 429, 5xx og
+        nettverksfeil/tidsavbrudd, med pausene i RETRY_PAUSER_SEKUNDER.
+
+        DUBLETTVERN (#850): POST og DELETE prøves ALDRI på nytt automatisk.
+        En skriving kan ha gått gjennom hos TickTick selv om svaret var en
+        feil eller et tidsavbrudd, og en ny sending ville gitt dubletter.
+        Det gjelder også 429 på en skriving: feilen returneres som før.
+        """
+        if method != "GET":
+            return self._send(method, url, data)
+
+        pauser = list(RETRY_PAUSER_SEKUNDER)
+        while True:
+            try:
+                response = self._send(method, url, data)
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout):
+                if not pauser:
+                    raise
+                response = None
+            if response is not None and response.status_code not in RETRY_STATUSKODER:
+                return response
+            if not pauser:
+                return response
+            pause = pauser.pop(0)
+            logger.warning(
+                f"Midlertidig feil ({'nettverk' if response is None else response.status_code}) "
+                f"på {method} {url}, prøver igjen om {pause} s.")
+            time.sleep(pause)
+
     def _make_request(self, method: str, endpoint: str, data=None) -> Dict:
         """
         Makes a request to the TickTick API.
-        
+
         Args:
             method: HTTP method (GET, POST, PUT, DELETE)
             endpoint: API endpoint (without base URL)
             data: Request data (for POST, PUT)
-        
+
         Returns:
             API response as a dictionary
         """
         url = f"{self.base_url}{endpoint}"
-        
+
         try:
-            response = self._send(method, url, data)
+            response = self._send_med_retry(method, url, data)
 
             if response.status_code == 401:
                 # Node-serveren kan alt ha fornyet tokenet - les delt fil

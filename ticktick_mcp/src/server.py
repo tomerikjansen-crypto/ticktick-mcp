@@ -660,6 +660,7 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
     
     blocks = []
     checked = 0
+    unreadable = []
 
     for i, project in enumerate(projects, 1):
         if project.get('closed'):
@@ -668,6 +669,11 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
 
         project_id = project.get('id', 'No ID')
         project_data = ticktick.get_project_with_data(project_id)
+        # #850: et feilsvar ({"error": ...}) er ikke en tom liste. Tell det, så
+        # svaret ikke stille ser komplett ut.
+        if not isinstance(project_data, dict) or 'error' in project_data:
+            unreadable.append(project.get('name') or project_id)
+            continue
         tasks = project_data.get('tasks', [])
 
         # Filter tasks using the provided function
@@ -684,11 +690,19 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
             block += f"Task {t}:\n{format_task(task, kompakt=True)}\n"
         blocks.append(block)
 
+    warning = ""
+    if unreadable:
+        warning = (f"ADVARSEL: {len(unreadable)} av {checked} lister kunne ikke leses "
+                   f"(svaret er ufullstendig): {', '.join(str(n) for n in unreadable)}\n\n")
+        if len(unreadable) == checked:
+            return (warning + "Ingen lister kunne leses. Dette betyr IKKE at det "
+                    f"ikke finnes oppgaver ('{filter_name}'). Prøv igjen om litt.")
+
     if not blocks:
-        return f"0 tasks matching '{filter_name}' across {checked} projects."
+        return warning + f"0 tasks matching '{filter_name}' across {checked} projects."
 
     result = f"Found matches in {len(blocks)} of {checked} projects:\n\n"
-    return result + "\n\n".join(blocks) + "\n"
+    return warning + result + "\n\n".join(blocks) + "\n"
 
 # New MCP Tools for Tasks
 
