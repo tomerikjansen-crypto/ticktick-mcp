@@ -90,7 +90,7 @@ class TestUlesteLister(unittest.TestCase):
         with patch.object(self.modul, "ticktick", klient):
             return self.modul._get_project_tasks_by_filter(self.prosjekter, filter_func, "x")
 
-    def test_delvis_feil_gir_varsel_øverst_og_beholder_treff(self):
+    def test_delvis_feil_gir_varsel_overst_og_beholder_treff(self):
         res = self._kjor({
             "p1": {"tasks": [_oppgave("a")]},
             "p2": {"error": "500 Server Error"},
@@ -118,6 +118,29 @@ class TestUlesteLister(unittest.TestCase):
         self.assertIn("3 av 3 lister kunne ikke leses", res)
         self.assertNotIn("0 tasks matching", res)
         self.assertIn("IKKE", res)
+
+    def test_stopper_etter_tre_uleste_lister_paa_rad(self):
+        prosjekter = [_prosjekt(f"q{n}", f"Q{n}") for n in range(1, 8)]
+        klient = MagicMock()
+        klient.get_project_with_data.return_value = {"error": "500"}
+        with patch.object(self.modul, "ticktick", klient):
+            res = self.modul._get_project_tasks_by_filter(prosjekter, lambda t: True, "x")
+        self.assertEqual(klient.get_project_with_data.call_count, 3)
+        self.assertTrue(res.startswith("ADVARSEL: 3 av 7 lister kunne ikke leses, 4 ikke forsøkt"),
+                        res[:120])
+        self.assertIn("IKKE", res)
+
+    def test_to_uleste_og_en_lest_stopper_ikke(self):
+        prosjekter = [_prosjekt(f"q{n}", f"Q{n}") for n in range(1, 7)]
+        data = {"q1": {"error": "x"}, "q2": {"error": "x"}, "q3": {"tasks": [_oppgave("a")]},
+                "q4": {"error": "x"}, "q5": {"error": "x"}, "q6": {"tasks": []}}
+        klient = MagicMock()
+        klient.get_project_with_data.side_effect = lambda pid: data[pid]
+        with patch.object(self.modul, "ticktick", klient):
+            res = self.modul._get_project_tasks_by_filter(prosjekter, lambda t: True, "x")
+        self.assertEqual(klient.get_project_with_data.call_count, 6)
+        self.assertTrue(res.startswith("ADVARSEL: 4 av 6 lister kunne ikke leses (svaret"))
+        self.assertNotIn("ikke forsøkt", res)
 
     def test_ingen_feil_gir_ingen_varsel(self):
         res = self._kjor({

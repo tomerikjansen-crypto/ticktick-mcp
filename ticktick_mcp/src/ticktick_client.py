@@ -23,6 +23,9 @@ TOKEN_FILE = Path.home() / ".ticktick" / "tokens.json"
 # #850: pauser mellom forsøk på lesekall (GET) ved midlertidige feil
 RETRY_PAUSER_SEKUNDER = (1, 2, 4)
 RETRY_STATUSKODER = (429, 500, 502, 503, 504)
+# Lesegrense (tilkobling, lesing). KUN GET: et klientsidig tidsavbrudd paa en
+# skriving kan skjule at den gikk gjennom, saa POST og DELETE har ingen timeout.
+LESE_TIMEOUT_SEKUNDER = (5, 20)
 
 
 def normaliser_refresh_token(verdi: Any) -> Optional[str]:
@@ -295,7 +298,7 @@ class TickTickClient:
     def _send(self, method: str, url: str, data=None):
         """Send ett HTTP-kall med gjeldende headers."""
         if method == "GET":
-            return requests.get(url, headers=self.headers)
+            return requests.get(url, headers=self.headers, timeout=LESE_TIMEOUT_SEKUNDER)
         elif method == "POST":
             return requests.post(url, headers=self.headers, json=data)
         elif method == "DELETE":
@@ -364,12 +367,12 @@ class TickTickClient:
                         logger.info("Using refreshed token from shared token file.")
                         self.access_token = shared["access_token"]
                         self.headers["Authorization"] = f"Bearer {self.access_token}"
-                        response = self._send(method, url, data)
+                        response = self._send_med_retry(method, url, data)
 
             if response.status_code == 401:
                 logger.info("Access token expired. Attempting to refresh...")
                 if self._refresh_access_token():
-                    response = self._send(method, url, data)
+                    response = self._send_med_retry(method, url, data)
 
             # Raise an exception for 4xx/5xx status codes
             response.raise_for_status()

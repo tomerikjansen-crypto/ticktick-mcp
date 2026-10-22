@@ -905,7 +905,7 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
             resultat = klient._make_request(method, *args)
         return resultat, sleep
 
-    def test_get_prøves_på_nytt_ved_500_og_lykkes(self):
+    def test_get_proves_paa_nytt_ved_500_og_lykkes(self):
         klient = _lag_klient_direkte()
         klient._send = MagicMock(side_effect=[
             self._respons(500), self._respons(429), self._respons(200, {"ok": 1})])
@@ -914,7 +914,7 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
         self.assertEqual(klient._send.call_count, 3)
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [1, 2])
 
-    def test_get_gir_opp_etter_tre_nye_forsøk_med_pausene_1_2_4(self):
+    def test_get_gir_opp_etter_tre_nye_forsok_med_pausene_1_2_4(self):
         klient = _lag_klient_direkte()
         klient._send = MagicMock(return_value=self._respons(503))
         resultat, sleep = self._kjor(klient, "GET", "/project")
@@ -922,7 +922,7 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
         self.assertEqual(klient._send.call_count, 4)
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [1, 2, 4])
 
-    def test_get_prøves_på_nytt_ved_tidsavbrudd(self):
+    def test_get_proves_paa_nytt_ved_nettverksfeil(self):
         from requests.exceptions import ConnectionError as ReqConnectionError
         klient = _lag_klient_direkte()
         klient._send = MagicMock(side_effect=[
@@ -931,7 +931,7 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
         self.assertEqual(resultat, {"ok": 2})
         self.assertEqual(klient._send.call_count, 2)
 
-    def test_get_404_prøves_ikke_på_nytt(self):
+    def test_get_404_proves_ikke_paa_nytt(self):
         klient = _lag_klient_direkte()
         klient._send = MagicMock(return_value=self._respons(404))
         resultat, sleep = self._kjor(klient, "GET", "/project/x")
@@ -970,6 +970,61 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
         resultat, sleep = self._kjor(klient, "DELETE", "/project/x/task/y")
         self.assertIn("error", resultat)
         self.assertEqual(klient._send.call_count, 1)
+
+    # Retterunde 1 (#850): timeout bare paa GET, retry ogsaa etter 401-fornyelse
+
+    def test_get_readtimeout_gir_fire_kall_og_pausene_1_2_4(self):
+        from requests.exceptions import ReadTimeout
+        klient = _lag_klient_direkte()
+        with patch("ticktick_mcp.src.ticktick_client.requests.get",
+                   side_effect=ReadTimeout("henger")) as get, \
+                patch("ticktick_mcp.src.ticktick_client.time.sleep") as sleep:
+            resultat = klient._make_request("GET", "/project")
+        self.assertIn("error", resultat)
+        self.assertEqual(get.call_count, 4)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1, 2, 4])
+
+    def test_get_sendes_med_lese_timeout(self):
+        from ticktick_mcp.src import ticktick_client as modul
+        klient = _lag_klient_direkte()
+        with patch("ticktick_mcp.src.ticktick_client.requests.get",
+                   return_value=self._respons(200, {"ok": 1})) as get:
+            klient._make_request("GET", "/project")
+        self.assertEqual(modul.LESE_TIMEOUT_SEKUNDER, (5, 20))
+        self.assertEqual(get.call_args.kwargs.get("timeout"), modul.LESE_TIMEOUT_SEKUNDER)
+
+    def test_post_og_delete_sendes_uten_timeout(self):
+        """Et klientsidig tidsavbrudd paa en skriving kan skjule at den gikk gjennom."""
+        klient = _lag_klient_direkte()
+        with patch("ticktick_mcp.src.ticktick_client.requests.post",
+                   return_value=self._respons(200, {"id": "x"})) as post, \
+                patch("ticktick_mcp.src.ticktick_client.requests.delete",
+                      return_value=self._respons(200)) as delete:
+            klient._make_request("POST", "/task", {"title": "TEST-x"})
+            klient._make_request("DELETE", "/project/x/task/y")
+        self.assertNotIn("timeout", post.call_args.kwargs)
+        self.assertNotIn("timeout", delete.call_args.kwargs)
+
+    def test_get_etter_401_fornyelse_faar_retry_ved_500(self):
+        klient = _lag_klient_direkte()
+        klient._read_token_file = MagicMock(return_value=None)
+        klient._refresh_access_token = MagicMock(return_value=True)
+        klient._send = MagicMock(side_effect=[
+            self._respons(401), self._respons(500), self._respons(200, {"ok": 3})])
+        resultat, sleep = self._kjor(klient, "GET", "/project")
+        self.assertEqual(resultat, {"ok": 3})
+        self.assertEqual(klient._send.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [1])
+
+    def test_post_etter_401_fornyelse_sendes_bare_en_gang_til(self):
+        klient = _lag_klient_direkte()
+        klient._read_token_file = MagicMock(return_value=None)
+        klient._refresh_access_token = MagicMock(return_value=True)
+        klient._send = MagicMock(side_effect=[self._respons(401), self._respons(500)])
+        resultat, sleep = self._kjor(klient, "POST", "/task", {"title": "TEST-x"})
+        self.assertIn("error", resultat)
+        self.assertEqual(klient._send.call_count, 2)
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

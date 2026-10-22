@@ -661,9 +661,18 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
     blocks = []
     checked = 0
     unreadable = []
+    read_ok = 0
+    in_a_row = 0
+    skipped = 0
 
     for i, project in enumerate(projects, 1):
         if project.get('closed'):
+            continue
+        # #850: etter tre uleste lister på rad stopper vi. Hver liste bruker
+        # hele retry-budsjettet, så full stans ville ellers ta minutter.
+        if in_a_row >= 3:
+            skipped += 1
+            checked += 1
             continue
         checked += 1
 
@@ -673,7 +682,10 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
         # svaret ikke stille ser komplett ut.
         if not isinstance(project_data, dict) or 'error' in project_data:
             unreadable.append(project.get('name') or project_id)
+            in_a_row += 1
             continue
+        in_a_row = 0
+        read_ok += 1
         tasks = project_data.get('tasks', [])
 
         # Filter tasks using the provided function
@@ -692,9 +704,10 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
 
     warning = ""
     if unreadable:
-        warning = (f"ADVARSEL: {len(unreadable)} av {checked} lister kunne ikke leses "
+        skipped_text = f", {skipped} ikke forsøkt" if skipped else ""
+        warning = (f"ADVARSEL: {len(unreadable)} av {checked} lister kunne ikke leses{skipped_text} "
                    f"(svaret er ufullstendig): {', '.join(str(n) for n in unreadable)}\n\n")
-        if len(unreadable) == checked:
+        if read_ok == 0:
             return (warning + "Ingen lister kunne leses. Dette betyr IKKE at det "
                     f"ikke finnes oppgaver ('{filter_name}'). Prøv igjen om litt.")
 
