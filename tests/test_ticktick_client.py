@@ -16,6 +16,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, mock_open
 
+# Testvern: en mock som bommer skal aldri kunne naa ekte TickTick. .invalid
+# slaas aldri opp (RFC 2606). Gjelder klienter laget med ekte __init__, som
+# leser URL-ene fra miljoeet (load_dotenv overstyrer ikke satte variabler).
+os.environ["TICKTICK_BASE_URL"] = "https://ticktick.invalid/open/v1"
+os.environ["TICKTICK_TOKEN_URL"] = "https://ticktick.invalid/oauth/token"
+
 
 @contextmanager
 def i_tom_mappe():
@@ -39,8 +45,8 @@ def _lag_klient_direkte(**attrs):
     obj.refresh_token = "test-refresh"
     obj.client_id = "test-client"
     obj.client_secret = "test-secret"
-    obj.base_url = "https://api.ticktick.com/open/v1"
-    obj.token_url = "https://ticktick.com/oauth/token"
+    obj.base_url = "https://ticktick.invalid/open/v1"
+    obj.token_url = "https://ticktick.invalid/oauth/token"
     obj.headers = {"Authorization": "Bearer test-token", "Content-Type": "application/json"}
     for k, v in attrs.items():
         setattr(obj, k, v)
@@ -996,9 +1002,9 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
     def test_post_og_delete_sendes_uten_timeout(self):
         """Et klientsidig tidsavbrudd paa en skriving kan skjule at den gikk gjennom."""
         klient = _lag_klient_direkte()
-        with patch("ticktick_mcp.src.ticktick_client.requests.Session.post",
+        with patch("ticktick_mcp.src.ticktick_client.requests.post",
                    return_value=self._respons(200, {"id": "x"})) as post, \
-                patch("ticktick_mcp.src.ticktick_client.requests.Session.delete",
+                patch("ticktick_mcp.src.ticktick_client.requests.delete",
                       return_value=self._respons(200)) as delete:
             klient._make_request("POST", "/task", {"title": "TEST-x"})
             klient._make_request("DELETE", "/project/x/task/y")

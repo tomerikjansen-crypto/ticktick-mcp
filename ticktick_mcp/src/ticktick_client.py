@@ -88,6 +88,8 @@ class TickTickClient:
 
     # mtime for siste observerte diskversjon, ogsaa ved mislykket lagring.
     _fil_mtime_ns: Optional[int] = None
+    # Delt keep-alive-sesjon for GET, opprettes ved første lesekall.
+    _http_sesjon: Optional[requests.Session] = None
 
     def __init__(self):
         load_dotenv()
@@ -296,22 +298,25 @@ class TickTickClient:
             self._fil_mtime_ns is None or mtime_ns > self._fil_mtime_ns)
 
     def _sesjon(self) -> requests.Session:
-        """Delt requests.Session (keep-alive): slipper ny TCP/TLS-forbindelse per kall."""
-        sesjon = self.__dict__.get("_http_sesjon")
-        if sesjon is None:
-            sesjon = requests.Session()
-            self.__dict__["_http_sesjon"] = sesjon
-        return sesjon
+        """Delt requests.Session (keep-alive) for lesekall: slipper ny TCP/TLS-forbindelse per GET."""
+        if self._http_sesjon is None:
+            self._http_sesjon = requests.Session()
+        return self._http_sesjon
 
     def _send(self, method: str, url: str, data=None):
-        """Send ett HTTP-kall med gjeldende headers."""
-        sesjon = self._sesjon()
+        """Send ett HTTP-kall med gjeldende headers.
+
+        Bare GET bruker den delte sesjonen. POST og DELETE går som før via
+        requests.post/delete (ny forbindelse, ingen gjenbrukt pool): en skriving
+        på en forbindelse serveren lukker samtidig kan gi feil på en skriving
+        som ikke ble behandlet, og #850 holder skrivinger konservative.
+        """
         if method == "GET":
-            return sesjon.get(url, headers=self.headers, timeout=LESE_TIMEOUT_SEKUNDER)
+            return self._sesjon().get(url, headers=self.headers, timeout=LESE_TIMEOUT_SEKUNDER)
         elif method == "POST":
-            return sesjon.post(url, headers=self.headers, json=data)
+            return requests.post(url, headers=self.headers, json=data)
         elif method == "DELETE":
-            return sesjon.delete(url, headers=self.headers)
+            return requests.delete(url, headers=self.headers)
         raise ValueError(f"Unsupported HTTP method: {method}")
 
     def _send_med_retry(self, method: str, url: str, data=None):
