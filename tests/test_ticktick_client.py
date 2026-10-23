@@ -976,7 +976,7 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
     def test_get_readtimeout_gir_fire_kall_og_pausene_1_2_4(self):
         from requests.exceptions import ReadTimeout
         klient = _lag_klient_direkte()
-        with patch("ticktick_mcp.src.ticktick_client.requests.get",
+        with patch("ticktick_mcp.src.ticktick_client.requests.Session.get",
                    side_effect=ReadTimeout("henger")) as get, \
                 patch("ticktick_mcp.src.ticktick_client.time.sleep") as sleep:
             resultat = klient._make_request("GET", "/project")
@@ -987,7 +987,7 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
     def test_get_sendes_med_lese_timeout(self):
         from ticktick_mcp.src import ticktick_client as modul
         klient = _lag_klient_direkte()
-        with patch("ticktick_mcp.src.ticktick_client.requests.get",
+        with patch("ticktick_mcp.src.ticktick_client.requests.Session.get",
                    return_value=self._respons(200, {"ok": 1})) as get:
             klient._make_request("GET", "/project")
         self.assertEqual(modul.LESE_TIMEOUT_SEKUNDER, (5, 20))
@@ -996,14 +996,26 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
     def test_post_og_delete_sendes_uten_timeout(self):
         """Et klientsidig tidsavbrudd paa en skriving kan skjule at den gikk gjennom."""
         klient = _lag_klient_direkte()
-        with patch("ticktick_mcp.src.ticktick_client.requests.post",
+        with patch("ticktick_mcp.src.ticktick_client.requests.Session.post",
                    return_value=self._respons(200, {"id": "x"})) as post, \
-                patch("ticktick_mcp.src.ticktick_client.requests.delete",
+                patch("ticktick_mcp.src.ticktick_client.requests.Session.delete",
                       return_value=self._respons(200)) as delete:
             klient._make_request("POST", "/task", {"title": "TEST-x"})
             klient._make_request("DELETE", "/project/x/task/y")
         self.assertNotIn("timeout", post.call_args.kwargs)
         self.assertNotIn("timeout", delete.call_args.kwargs)
+
+    def test_alle_kall_deler_en_requests_session(self):
+        """Keep-alive (epost-fart): samme Session til flere kall, ikke requests.get per kall."""
+        klient = _lag_klient_direkte()
+        with patch("ticktick_mcp.src.ticktick_client.requests.Session.get",
+                   return_value=self._respons(200, {"ok": 1})) as get, \
+                patch("ticktick_mcp.src.ticktick_client.requests.get") as bar_get:
+            klient._make_request("GET", "/project")
+            klient._make_request("GET", "/project/x/data")
+        self.assertEqual(get.call_count, 2)
+        bar_get.assert_not_called()
+        self.assertIs(klient._sesjon(), klient._sesjon())
 
     def test_get_etter_401_fornyelse_faar_retry_ved_500(self):
         klient = _lag_klient_direkte()

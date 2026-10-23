@@ -295,14 +295,23 @@ class TickTickClient:
         return mtime_ns is not None and (
             self._fil_mtime_ns is None or mtime_ns > self._fil_mtime_ns)
 
+    def _sesjon(self) -> requests.Session:
+        """Delt requests.Session (keep-alive): slipper ny TCP/TLS-forbindelse per kall."""
+        sesjon = self.__dict__.get("_http_sesjon")
+        if sesjon is None:
+            sesjon = requests.Session()
+            self.__dict__["_http_sesjon"] = sesjon
+        return sesjon
+
     def _send(self, method: str, url: str, data=None):
         """Send ett HTTP-kall med gjeldende headers."""
+        sesjon = self._sesjon()
         if method == "GET":
-            return requests.get(url, headers=self.headers, timeout=LESE_TIMEOUT_SEKUNDER)
+            return sesjon.get(url, headers=self.headers, timeout=LESE_TIMEOUT_SEKUNDER)
         elif method == "POST":
-            return requests.post(url, headers=self.headers, json=data)
+            return sesjon.post(url, headers=self.headers, json=data)
         elif method == "DELETE":
-            return requests.delete(url, headers=self.headers)
+            return sesjon.delete(url, headers=self.headers)
         raise ValueError(f"Unsupported HTTP method: {method}")
 
     def _send_med_retry(self, method: str, url: str, data=None):
