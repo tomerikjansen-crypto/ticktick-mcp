@@ -110,7 +110,7 @@ class TestListerBrukerKompakt(unittest.TestCase):
 
     def test_filtrert_liste_trunkerer(self):
         prosjekter = [{"id": "p1", "name": "Liste A", "closed": False}]
-        data = {"p1": {"tasks": [_oppgave(content=self.lang)]}}
+        data = {"p1": {"tasks": [_oppgave(content=self.lang)]}, "inbox": {"tasks": []}}
         klient = self.MagicMock()
         klient.get_project_with_data.side_effect = lambda pid: data[pid]
         with self.patch.object(self.modul, "ticktick", klient):

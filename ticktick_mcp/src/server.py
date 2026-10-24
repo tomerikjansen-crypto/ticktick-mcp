@@ -26,6 +26,10 @@ ticktick = None
 # 879 and largest 2 750. Single-task views ignore this and show everything.
 KOMPAKT_CONTENT_GRENSE = 200
 
+# #923: innboksen finnes ikke i prosjektlisten. API-et godtar aliaset "inbox" som prosjekt-ID.
+INBOX_ID = "inbox"
+INBOX_NAME = "Innboks"
+
 def initialize_client():
     global ticktick
     try:
@@ -646,18 +650,22 @@ def _validate_task_data(task_data: Dict[str, Any], task_index: int) -> Optional[
 def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name: str) -> str:
     """
     Helper function to filter tasks across all projects.
-    
+
+    Innboksen (#923) ligger ikke i prosjektlisten fra API-et, men legges sist i den lokale
+    lista som itereres her, slik at den får samme filtrering, telling, ADVARSEL og stoppregel
+    (tre uleste på rad) som vanlige prosjekter. Aliaset "inbox" videresendes til API-et, og
+    oppgavenes egen projectId beholdes i utskriften.
+
     Args:
         projects: List of project dictionaries
         filter_func: Function that takes a task and returns True if it matches the filter
         filter_name: Name of the filter for output formatting
-    
+
     Returns:
         Formatted string of filtered tasks
     """
-    if not projects:
-        return "No projects found."
-    
+    projects = list(projects or []) + [{"id": INBOX_ID, "name": INBOX_NAME}]
+
     blocks = []
     checked = 0
     unreadable = []
@@ -721,7 +729,7 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
 
 @mcp.tool()
 async def get_all_tasks() -> str:
-    """Get all tasks from TickTick. Ignores closed projects.
+    """Get all tasks from TickTick, including the Inbox (Innboks). Ignores closed projects.
 
     Descriptions longer than 200 chars are TRUNCATED here and marked as such;
     call get_task for a task's full text before drawing conclusions from it.
@@ -747,7 +755,7 @@ async def get_all_tasks() -> str:
 @mcp.tool()
 async def get_tasks_by_priority(priority_id: int) -> str:
     """
-    Get all tasks from TickTick by priority. Ignores closed projects.
+    Get all tasks from TickTick by priority, including the Inbox (Innboks). Ignores closed projects.
 
     Descriptions longer than 200 chars are TRUNCATED here and marked as such;
     call get_task for a task's full text before drawing conclusions from it.
@@ -779,7 +787,7 @@ async def get_tasks_by_priority(priority_id: int) -> str:
 
 @mcp.tool()
 async def get_tasks_due_today() -> str:
-    """Get all tasks from TickTick that are due today. Ignores closed projects.
+    """Get all tasks from TickTick that are due today, including the Inbox (Innboks). Ignores closed projects.
 
     Descriptions longer than 200 chars are TRUNCATED here and marked as such;
     call get_task for a task's full text before drawing conclusions from it.
@@ -804,7 +812,7 @@ async def get_tasks_due_today() -> str:
 
 @mcp.tool()
 async def get_overdue_tasks() -> str:
-    """Get all overdue tasks from TickTick. Ignores closed projects.
+    """Get all overdue tasks from TickTick, including the Inbox (Innboks). Ignores closed projects.
 
     Descriptions longer than 200 chars are TRUNCATED here and marked as such;
     call get_task for a task's full text before drawing conclusions from it.
@@ -829,7 +837,7 @@ async def get_overdue_tasks() -> str:
 
 @mcp.tool()
 async def get_tasks_due_tomorrow() -> str:
-    """Get all tasks from TickTick that are due tomorrow. Ignores closed projects."""
+    """Get all tasks from TickTick that are due tomorrow, including the Inbox (Innboks). Ignores closed projects."""
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -851,7 +859,7 @@ async def get_tasks_due_tomorrow() -> str:
 @mcp.tool()
 async def get_tasks_due_in_days(days: int) -> str:
     """
-    Get all tasks from TickTick that are due in exactly X days. Ignores closed projects.
+    Get all tasks from TickTick that are due in exactly X days, including the Inbox (Innboks). Ignores closed projects.
     
     Args:
         days: Number of days from today (0 = today, 1 = tomorrow, etc.)
@@ -880,7 +888,7 @@ async def get_tasks_due_in_days(days: int) -> str:
 
 @mcp.tool()
 async def get_tasks_due_this_week() -> str:
-    """Get all tasks from TickTick that are due within the next 7 days. Ignores closed projects."""
+    """Get all tasks from TickTick that are due within the next 7 days, including the Inbox (Innboks). Ignores closed projects."""
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -912,7 +920,7 @@ async def get_tasks_due_this_week() -> str:
 @mcp.tool()
 async def search_tasks(search_term: str) -> str:
     """
-    Search for tasks in TickTick by title, content, or subtask titles. Ignores closed projects.
+    Search for tasks in TickTick by title, content, or subtask titles, including the Inbox (Innboks). Ignores closed projects.
 
     The search runs against the FULL text, but descriptions longer than 200 chars
     are TRUNCATED in the output and marked as such - so a match can sit past the
@@ -1048,6 +1056,7 @@ async def get_engaged_tasks() -> str:
     """
     Get all tasks from TickTick that are "Engaged".
     This includes tasks marked as high priority (5), due today or overdue.
+    The Inbox (Innboks) is included.
     """
     if not ticktick:
         if not initialize_client():
@@ -1075,6 +1084,7 @@ async def get_next_tasks() -> str:
     """
     Get all tasks from TickTick that are "Next".
     This includes tasks marked as medium priority (3) or due tomorrow.
+    The Inbox (Innboks) is included.
     """
     if not ticktick:
         if not initialize_client():
