@@ -1022,6 +1022,15 @@ class TestRetryVedMidlertidigeFeil(unittest.TestCase):
         self.assertEqual(get.call_count, 2)
         bar_get.assert_not_called()
         self.assertIs(klient._sesjon(), klient._sesjon())
+        # Retterunde 1: lås selve gjenbruket. Argument 0 i hvert kall er SAMME sesjonsobjekt
+        # (eksplisitt klasseform, #924), headers er klientens egne, og URL-en er argument 1.
+        sesjon = klient._sesjon()
+        self.assertEqual(get.call_count, 2)
+        for kall in get.call_args_list:
+            self.assertIs(kall.args[0], sesjon)
+            self.assertIs(kall.kwargs.get("headers"), klient.headers)
+        self.assertEqual([c.args[1] for c in get.call_args_list],
+                         [f"{klient.base_url}/project", f"{klient.base_url}/project/x/data"])
 
     def test_get_etter_401_fornyelse_faar_retry_ved_500(self):
         klient = _lag_klient_direkte()

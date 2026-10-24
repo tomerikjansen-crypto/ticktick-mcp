@@ -664,7 +664,11 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
     Returns:
         Formatted string of filtered tasks
     """
-    projects = list(projects or []) + [{"id": INBOX_ID, "name": INBOX_NAME}]
+    projects = list(projects or [])
+    # Bare når API-et ikke selv har tatt innboksen med i prosjektlisten (ekte ID: "inbox" + kontonummer),
+    # så den aldri leses og vises to ganger.
+    if not any(str(p.get('id', '')).startswith(INBOX_ID) for p in projects):
+        projects.append({"id": INBOX_ID, "name": INBOX_NAME})
 
     blocks = []
     checked = 0
@@ -705,6 +709,10 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
             continue
 
         block = f"Project {i}:\n{format_project(project)}"
+        if project.get('id') == INBOX_ID:
+            # ID-en over er bare oppslagsaliaset. Skrivekall (complete_task, update_task, delete_task)
+            # skal bruke oppgavens egen Project ID.
+            block += "Merk: ID over er bare aliaset for innboksen. Bruk oppgavens egen Project ID i skrivekall.\n"
         block += f"With {len(filtered_tasks)} tasks that are to be '{filter_name}' in this project :\n"
         for t, task in filtered_tasks:
             block += f"Task {t}:\n{format_task(task, kompakt=True)}\n"

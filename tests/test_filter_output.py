@@ -242,6 +242,33 @@ class TestInnboksen(unittest.TestCase):
         self.assertNotIn("p4", lest)
         self.assertIn("inbox", lest)
 
+    def test_innboksblokken_peker_paa_oppgavens_egen_project_id_for_skrivekall(self):
+        res, _ = self._kjor({"p1": {"tasks": []}, "inbox": {"tasks": [_inbox_oppgave("i")]}})
+        self.assertIn("ID: inbox\n", res)
+        self.assertIn("Bruk oppgavens egen Project ID i skrivekall", res)
+
+    def test_vanlige_prosjekter_far_ikke_skrivekallnotatet(self):
+        res, _ = self._kjor({"p1": {"tasks": [_oppgave("a")]}, "inbox": {"tasks": []}})
+        self.assertIn("Liste A", res)
+        self.assertNotIn("skrivekall", res)
+
+    def test_innboks_i_prosjektlisten_legges_ikke_til_en_gang_til(self):
+        prosjekter = [_prosjekt("p1", "Liste A"), _prosjekt("inbox123", "Inbox")]
+        res, klient = self._kjor(
+            {"p1": {"tasks": []}, "inbox123": {"tasks": [_inbox_oppgave("en-gang")]}},
+            prosjekter=prosjekter)
+        self.assertEqual([c.args[0] for c in klient.get_project_with_data.call_args_list], ["p1", "inbox123"])
+        self.assertEqual(res.count("Title: en-gang"), 1)
+        self.assertNotIn("Innboks", res)
+        self.assertIn("1 of 2 projects", res)
+
+    def test_innboks_legges_til_naar_ingen_prosjekt_har_inbox_id(self):
+        # "inbox" er ikke et prefiks av andre ID-er ("p1"), og prosjekter med liknende navn utløser ikke vakten.
+        prosjekter = [_prosjekt("p1", "Inbox-liste")]
+        res, klient = self._kjor({"p1": {"tasks": []}, "inbox": {"tasks": [_inbox_oppgave("x")]}},
+                                 prosjekter=prosjekter)
+        self.assertEqual([c.args[0] for c in klient.get_project_with_data.call_args_list], ["p1", "inbox"])
+
     def test_tom_innboks_gir_ingen_tom_blokk(self):
         res, _ = self._kjor({"p1": {"tasks": [_oppgave("a")]}, "inbox": {"tasks": []}})
         self.assertNotIn("Innboks", res)
