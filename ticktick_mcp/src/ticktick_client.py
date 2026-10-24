@@ -312,7 +312,13 @@ class TickTickClient:
         som ikke ble behandlet, og #850 holder skrivinger konservative.
         """
         if method == "GET":
-            return self._sesjon().get(url, headers=self.headers, timeout=LESE_TIMEOUT_SEKUNDER)
+            # Eksplisitt klasseform (samme kall som self._sesjon().get(...)): valgt så kilderegisteret
+            # ser kallstedet som en GET-transport (#924).
+            return requests.Session.get(
+                self._sesjon(), url,
+                headers=self.headers,
+                timeout=LESE_TIMEOUT_SEKUNDER,
+            )
         elif method == "POST":
             return requests.post(url, headers=self.headers, json=data)
         elif method == "DELETE":
