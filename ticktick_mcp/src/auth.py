@@ -352,7 +352,8 @@ class TickTickAuth:
         try:
             self._skriv_klient_env()
             env_ok = True
-        except OSError as e:
+        except (OSError, ValueError) as e:
+            # ValueError: ugyldig UTF-8 i en eksisterende .env (UnicodeDecodeError).
             logger.warning(f"Could not write .env file ({type(e).__name__}).")
             env_ok = False
         return (fil_ok, env_ok)

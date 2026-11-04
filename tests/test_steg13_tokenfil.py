@@ -145,6 +145,19 @@ def test_cli_uten_argumenter_oppfoerer_seg_som_run(isolert, monkeypatch, capsys)
     assert capsys.readouterr().out == ""
 
 
+def test_cli_med_stdin_none_kaller_ikke_input_og_gir_kode_1(isolert, monkeypatch, capsys):
+    """M1: under pythonw er sys.stdin None. Ingen AttributeError, ingen input()."""
+    cli = _kjor_cli(monkeypatch, ["run"])
+    monkeypatch.setattr(sys, "stdin", None)
+    with patch.object(cli, "server_main") as server_main, pytest.raises(SystemExit) as avslutning:
+        cli.main()
+    assert avslutning.value.code == 1
+    server_main.assert_not_called()
+    ut = capsys.readouterr()
+    assert ut.out == ""
+    assert "ticktick-auth.mjs" in ut.err
+
+
 def test_cli_med_tokenfil_starter_serveren_uten_stdout_og_uten_input(
         isolert, monkeypatch, capsys):
     _skriv_tokenfil(isolert)
@@ -168,6 +181,11 @@ def _prosess(tmp_path, tokenfil_innhold=None):
     arbeid = tmp_path / "prosessarbeid"
     arbeid.mkdir()
     miljo = {k: v for k, v in os.environ.items() if not k.startswith("TICKTICK_")}
+    # Satt-men-tom: python-dotenv overskriver ikke satte variabler, saa en ekte .env
+    # ved siden av pakken (hovedtreet) kan ikke slippe et token inn i barneprosessen.
+    for navn in ("TICKTICK_ACCESS_TOKEN", "TICKTICK_REFRESH_TOKEN",
+                 "TICKTICK_CLIENT_ID", "TICKTICK_CLIENT_SECRET"):
+        miljo[navn] = ""
     miljo.update({"USERPROFILE": str(hjem), "HOME": str(hjem),
                   "TICKTICK_BASE_URL": "https://ticktick.invalid/open/v1",
                   "TICKTICK_TOKEN_URL": "https://ticktick.invalid/oauth/token",
@@ -180,6 +198,7 @@ def test_cli_som_prosess_uten_tilgang_gir_kode_1_tom_stdout_og_melding_paa_stder
     ferdig = _prosess(tmp_path)
     assert ferdig.returncode == 1
     assert ferdig.stdout == ""
+    assert "Ingen TickTick-tilgang" in ferdig.stderr
     assert "ticktick-auth.mjs" in ferdig.stderr
 
 
@@ -258,6 +277,26 @@ def test_innlogging_skriver_tokenparet_bare_til_tokenfila(
     if eksisterende_env is not None:
         # Eksisterende innhold er bevart (bare manglende klientverdier legges til).
         assert (tmp_path / ".env").read_bytes().startswith(eksisterende_env)
+
+
+def test_innlogging_med_ugyldig_utf8_i_env_gir_aerlig_melding_og_beholder_tokenfila(
+        isolert, tmp_path):
+    """R2: cp1252-tegn i .env (UnicodeDecodeError) skal ikke gi 'Error during OAuth flow'."""
+    from ticktick_mcp.src.auth import TickTickAuth
+    env = tmp_path / ".env"
+    env.write_bytes(b"# \xe6\xf8\xe5\n")
+    foer = env.read_bytes()
+    auth = TickTickAuth(client_id="TEST-cid", client_secret="TEST-csecret")
+    auth.auth_code = "TEST-kode"
+    respons = MagicMock()
+    respons.raise_for_status.return_value = None
+    respons.json.return_value = {"access_token": "TEST-access-ny", "refresh_token": "TEST-refresh-ny"}
+    with patch("ticktick_mcp.src.auth.requests.post", return_value=respons):
+        melding = auth.exchange_code_for_token()
+    assert "successful" in melding.lower()
+    assert ".env could not be written" in melding
+    assert json.loads(isolert.read_text(encoding="utf-8"))["access_token"] == "TEST-access-ny"
+    assert env.read_bytes() == foer
 
 
 def test_innlogging_uten_nye_klientverdier_roerer_ikke_env(isolert, tmp_path):

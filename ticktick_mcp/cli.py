@@ -49,7 +49,7 @@ def main():
     if args.command == "run" and not check_auth_setup():
         # Uten terminal er stdin/stdout MCP-protokollen (stdio): aldri input() eller
         # utskrift til stdout, bare melding paa stderr og avslutning med kode 1.
-        if not sys.stdin.isatty():
+        if sys.stdin is None or not sys.stdin.isatty():
             print(INGEN_TILGANG_MELDING, file=sys.stderr)
             sys.exit(1)
         print("""
