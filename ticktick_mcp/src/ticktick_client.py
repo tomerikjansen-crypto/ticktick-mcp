@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 # Delt tokenfil med dashboard-serverens Node-tokenmodul (prosjektering-repoet,
 # fase 2 K5): ett token-system paa tvers av Python og Node.
-# Miljoe/.env brukes bare naar tokenfila ikke finnes. Deretter er hele fila
+# Miljoe/.env brukes bare naar tokenfila ikke finnes, og tokenparet skrives
+# aldri til .env. Deretter er hele fila
 # autoritativ, ogsaa manglende/null refresh_token. Nyere fil avgjoeres av mtime,
 # aldri av oppdatert (kun informasjon). Innlogging og fornyelse skriver atomisk.
 TOKEN_FILE = Path.home() / ".ticktick" / "tokens.json"
@@ -33,6 +34,52 @@ def normaliser_refresh_token(verdi: Any) -> Optional[str]:
     if isinstance(verdi, str) and verdi.strip():
         return verdi
     return None
+
+
+# Kontrollert feilmelding naar hverken tokenfil eller miljoe gir tilgang.
+INNLOGGING_KOMMANDO = r"node C:\dev\Prosjektering\tools\ticktick-auth.mjs"
+INGEN_TILGANG_MELDING = (
+    f"Ingen TickTick-tilgang: fant verken en gyldig {TOKEN_FILE} eller TICKTICK_ACCESS_TOKEN "
+    f"i miljoeet. Logg inn med: {INNLOGGING_KOMMANDO}"
+)
+
+
+def les_token_fil() -> Optional[Dict]:
+    """
+    Les den delte tokenfila. Returnerer dict (med _mtime_ns) ved gyldig fil,
+    ellers None (manglende, korrupt eller uten gyldig access_token).
+    """
+    try:
+        if TOKEN_FILE.exists():
+            # Samme aapne fil gir innhold og mtime selv ved atomisk replace.
+            with TOKEN_FILE.open(encoding="utf-8") as tokenfil:
+                data = json.load(tokenfil)
+                mtime_ns = os.fstat(tokenfil.fileno()).st_mtime_ns
+            if not isinstance(data, dict):
+                logger.warning("Shared token file is not a JSON object. Ignoring it.")
+                return None
+            token = data.get("access_token")
+            if isinstance(token, str) and token.strip():
+                data["_mtime_ns"] = mtime_ns
+                return data
+    except (OSError, ValueError) as e:
+        # ValueError dekker baade JSONDecodeError og UnicodeDecodeError
+        logger.warning(f"Could not read shared token file: {e}")
+    return None
+
+
+def har_gyldig_tilgang() -> bool:
+    """
+    Regelen for oppstart paa ett sted, den samme som TickTickClient.__init__:
+    finnes tokenfila, er den fasit (ugyldig fil gir ikke miljoefallback); bare
+    naar den mangler brukes TICKTICK_ACCESS_TOKEN fra miljoe/.env.
+    """
+    load_dotenv()
+    if les_token_fil() is not None:
+        return True
+    if TOKEN_FILE.exists():
+        return False
+    return bool(os.getenv("TICKTICK_ACCESS_TOKEN"))
 
 
 def skriv_token_fil(access_token: str, refresh_token: Optional[str], kilde: str,
@@ -110,8 +157,7 @@ class TickTickClient:
             self.refresh_token = normaliser_refresh_token(os.getenv("TICKTICK_REFRESH_TOKEN"))
 
         if not self.access_token:
-            raise ValueError("TICKTICK_ACCESS_TOKEN environment variable is not set. "
-                            "Please run 'uv run -m ticktick_mcp.authenticate' to set up your credentials.")
+            raise ValueError(INGEN_TILGANG_MELDING)
             
         self.base_url = os.getenv("TICKTICK_BASE_URL") or "https://api.ticktick.com/open/v1"
         self.token_url = os.getenv("TICKTICK_TOKEN_URL") or "https://ticktick.com/oauth/token"
@@ -183,13 +229,6 @@ class TickTickClient:
             # Den autoritative tokenfila FOERST, slik at Node ser fornyelsen.
             self._write_token_file()
 
-            # .env er sekundaer lagring: en feil her skal aldri hindre resten
-            try:
-                self._save_tokens_to_env(tokens)
-            except OSError as e:
-                logger.warning(f"Could not write .env file ({type(e).__name__}). "
-                               "The shared token file was handled separately.")
-
             logger.info("Access token refreshed successfully.")
             return True
             
@@ -197,46 +236,6 @@ class TickTickClient:
             logger.error(f"Error refreshing access token: {e}")
             return False
     
-    def _save_tokens_to_env(self, tokens: Dict[str, str]) -> None:
-        """
-        Save the tokens to the .env file.
-        
-        Args:
-            tokens: A dictionary containing the access_token and optionally refresh_token
-        """
-        # Load existing .env file content
-        env_path = Path('.env')
-        env_content = {}
-        
-        if env_path.exists():
-            with open(env_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        env_content[key] = value
-        
-        # Update with new tokens
-        env_content["TICKTICK_ACCESS_TOKEN"] = tokens.get('access_token', '')
-        # Bare en faktisk rotert refresh-token skrives: null/tom lar den
-        # eksisterende stå, og "None" kan aldri havne i .env
-        ny_refresh = normaliser_refresh_token(tokens.get('refresh_token'))
-        if ny_refresh:
-            env_content["TICKTICK_REFRESH_TOKEN"] = ny_refresh
-        
-        # Make sure client credentials are saved as well
-        if self.client_id and "TICKTICK_CLIENT_ID" not in env_content:
-            env_content["TICKTICK_CLIENT_ID"] = self.client_id
-        if self.client_secret and "TICKTICK_CLIENT_SECRET" not in env_content:
-            env_content["TICKTICK_CLIENT_SECRET"] = self.client_secret
-        
-        # Write back to .env file
-        with open(env_path, 'w') as f:
-            for key, value in env_content.items():
-                f.write(f"{key}={value}\n")
-        
-        logger.debug("Tokens saved to .env file")
-
     @staticmethod
     def _refresh_fra_fil(shared: Dict) -> Optional[str]:
         """
@@ -254,23 +253,7 @@ class TickTickClient:
 
     def _read_token_file(self) -> Optional[Dict]:
         """Les den delte tokenfila. Returnerer None ved manglende/korrupt fil."""
-        try:
-            if TOKEN_FILE.exists():
-                # Samme aapne fil gir innhold og mtime selv ved atomisk replace.
-                with TOKEN_FILE.open(encoding="utf-8") as tokenfil:
-                    data = json.load(tokenfil)
-                    mtime_ns = os.fstat(tokenfil.fileno()).st_mtime_ns
-                if not isinstance(data, dict):
-                    logger.warning("Shared token file is not a JSON object. Ignoring it.")
-                    return None
-                token = data.get("access_token")
-                if isinstance(token, str) and token.strip():
-                    data["_mtime_ns"] = mtime_ns
-                    return data
-        except (OSError, ValueError) as e:
-            # ValueError dekker baade JSONDecodeError og UnicodeDecodeError
-            logger.warning(f"Could not read shared token file: {e}")
-        return None
+        return les_token_fil()
 
     def _write_token_file(self) -> None:
         """Skriv gjeldende tokens til den delte fila (atomisk via tmp+replace)."""

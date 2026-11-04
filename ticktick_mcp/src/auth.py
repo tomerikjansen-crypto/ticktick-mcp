@@ -306,17 +306,20 @@ class TickTickAuth:
                 return ("Error exchanging code for token: the response contained no valid "
                         "access token. Nothing was saved. Please try again.")
 
-            # Tokenfila (autoritativ) skrives foerst, saa .env
-            fil_ok, env_ok = self._save_tokens_to_env()
+            # Tokenparet skrives bare til den delte tokenfila (aldri .env).
+            # .env kan faa manglende CLIENT_ID/CLIENT_SECRET.
+            fil_ok, env_ok = self._save_tokens()
 
             if not fil_ok:
                 return ("Error: the login could not be saved to the shared token file, which "
                         "takes precedence at startup, so the new login will NOT take effect. "
                         "Check write access to the token file folder and try again.")
             if not env_ok:
-                return ("Authentication successful. The shared token file was updated, but "
-                        ".env could not be written.")
-            return "Authentication successful! Access token saved to the shared token file and .env."
+                return ("Authentication successful. The tokens were saved to the shared token file "
+                        "(~/.ticktick/tokens.json), but .env could not be written "
+                        "(client id and secret).")
+            return ("Authentication successful! The tokens were saved to the shared token file "
+                    "(~/.ticktick/tokens.json).")
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Error exchanging code for token: {e}")
@@ -328,9 +331,11 @@ class TickTickAuth:
                     return f"Error exchanging code for token: {e.response.text}"
             return f"Error exchanging code for token: {str(e)}"
     
-    def _save_tokens_to_env(self) -> Tuple[bool, bool]:
+    def _save_tokens(self) -> Tuple[bool, bool]:
         """
-        Lagre tokens: den delte tokenfila FOERST (den vinner ved oppstart), saa .env.
+        Lagre tokenparet BARE i den delte tokenfila (den vinner ved oppstart).
+        Access- og refresh-token skrives aldri til .env. .env faar bare
+        TICKTICK_CLIENT_ID/TICKTICK_CLIENT_SECRET som mangler der.
 
         Returns:
             (tokenfil_ok, env_ok). En feil i .env hindrer aldri tokenfila.
@@ -345,47 +350,39 @@ class TickTickAuth:
             logger.warning("Could not update the shared token file; the new login may "
                            "not take effect until it is written.")
         try:
-            self._skriv_env()
+            self._skriv_klient_env()
             env_ok = True
         except OSError as e:
             logger.warning(f"Could not write .env file ({type(e).__name__}).")
             env_ok = False
         return (fil_ok, env_ok)
 
-    def _skriv_env(self) -> None:
-        """Skriv tokens til .env (kan kaste OSError)."""
-        # Load existing .env file content
+    def _skriv_klient_env(self) -> None:
+        """
+        Legg til TICKTICK_CLIENT_ID/TICKTICK_CLIENT_SECRET i .env hvis de mangler
+        der (kan kaste OSError). Eksisterende innhold beholdes uendret, og er
+        begge allerede der, roeres ikke fila. Aldri tokenverdier.
+        """
         env_path = Path('.env')
-        env_content = {}
-        
-        if env_path.exists():
-            with open(env_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        env_content[key] = value
-        
-        # Update with new tokens
-        env_content["TICKTICK_ACCESS_TOKEN"] = self.tokens.get('access_token', '')
-        if 'refresh_token' in self.tokens:
-            # Ny innlogging: null/tom betyr ingen refresh-token utstedt. Skriv
-            # tom verdi (aldri strengen "None") slik at en gammel ikke blir staaende
-            env_content["TICKTICK_REFRESH_TOKEN"] = normaliser_refresh_token(
-                self.tokens.get('refresh_token')) or ''
-        
-        # Make sure client credentials are saved as well
-        if self.client_id and "TICKTICK_CLIENT_ID" not in env_content:
-            env_content["TICKTICK_CLIENT_ID"] = self.client_id
-        if self.client_secret and "TICKTICK_CLIENT_SECRET" not in env_content:
-            env_content["TICKTICK_CLIENT_SECRET"] = self.client_secret
-        
-        # Write back to .env file
-        with open(env_path, 'w') as f:
-            for key, value in env_content.items():
-                f.write(f"{key}={value}\n")
-        
-        logger.info("Tokens saved to .env file")
+        eksisterende = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        nokler = set()
+        for linje in eksisterende.splitlines():
+            linje = linje.strip()
+            if linje and not linje.startswith('#') and '=' in linje:
+                nokler.add(linje.split('=', 1)[0].strip())
+
+        nye = []
+        if self.client_id and "TICKTICK_CLIENT_ID" not in nokler:
+            nye.append(f"TICKTICK_CLIENT_ID={self.client_id}\n")
+        if self.client_secret and "TICKTICK_CLIENT_SECRET" not in nokler:
+            nye.append(f"TICKTICK_CLIENT_SECRET={self.client_secret}\n")
+        if not nye:
+            return
+
+        skille = "\n" if eksisterende and not eksisterende.endswith("\n") else ""
+        with open(env_path, 'a', encoding="utf-8") as f:
+            f.write(skille + "".join(nye))
+        logger.info("Client credentials saved to .env file")
 
 def setup_auth_cli():
     """Run the authentication flow as a CLI utility."""

@@ -4,20 +4,18 @@ Command-line interface for TickTick MCP server.
 """
 
 import sys
-import os
 import argparse
 import logging
 from pathlib import Path
-from dotenv import load_dotenv
 
 from .src.server import main as server_main
+from .src.ticktick_client import INGEN_TILGANG_MELDING, har_gyldig_tilgang
 from .authenticate import main as auth_main
 
 
 def check_auth_setup() -> bool:
-    """Check if authentication is set up properly."""
-    load_dotenv()
-    return os.getenv("TICKTICK_ACCESS_TOKEN") is not None
+    """Check if authentication is set up properly (gyldig tokens.json, ellers miljoeet)."""
+    return har_gyldig_tilgang()
 
 def main():
     """Entry point for the CLI."""
@@ -49,6 +47,11 @@ def main():
     
     # For the run command, check if auth is set up
     if args.command == "run" and not check_auth_setup():
+        # Uten terminal er stdin/stdout MCP-protokollen (stdio): aldri input() eller
+        # utskrift til stdout, bare melding paa stderr og avslutning med kode 1.
+        if not sys.stdin.isatty():
+            print(INGEN_TILGANG_MELDING, file=sys.stderr)
+            sys.exit(1)
         print("""
 ╔════════════════════════════════════════════════╗
 ║      TickTick MCP Server - Authentication      ║

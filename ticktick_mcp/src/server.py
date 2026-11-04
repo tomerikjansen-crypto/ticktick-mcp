@@ -1,14 +1,17 @@
 import asyncio
 import json
-import os
 import logging
 from datetime import datetime, timezone, date, timedelta
 from typing import Dict, List, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
-from dotenv import load_dotenv
 
-from .ticktick_client import TickTickClient
+from .ticktick_client import (
+    INGEN_TILGANG_MELDING,
+    INNLOGGING_KOMMANDO,
+    TickTickClient,
+    har_gyldig_tilgang,
+)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -33,12 +36,10 @@ INBOX_NAME = "Innboks"
 def initialize_client():
     global ticktick
     try:
-        # Check if .env file exists with access token
-        load_dotenv()
-        
-        # Check if we have valid credentials
-        if os.getenv("TICKTICK_ACCESS_TOKEN") is None:
-            logger.error("No access token found in .env file. Please run 'uv run -m ticktick_mcp.cli auth' to authenticate.")
+        # Samme regel som klienten: en gyldig tokenfil er fasit, miljoeet brukes
+        # bare naar fila mangler (felles funksjon i ticktick_client).
+        if not har_gyldig_tilgang():
+            logger.error(INGEN_TILGANG_MELDING)
             return False
         
         # Initialize the client
@@ -49,7 +50,7 @@ def initialize_client():
         projects = ticktick.get_projects()
         if isinstance(projects, dict) and 'error' in projects:
             logger.error(f"Failed to access TickTick API: {projects['error']}")
-            logger.error("Your access token may have expired. Please run 'uv run -m ticktick_mcp.cli auth' to refresh it.")
+            logger.error(f"Your access token may have expired. Log in again with: {INNLOGGING_KOMMANDO}")
             return False
             
         logger.info(f"Successfully connected to TickTick API with {len(projects)} projects")
@@ -1162,7 +1163,8 @@ def main():
     # Initialize the TickTick client
     if not initialize_client():
         logger.error("Failed to initialize TickTick client. Please check your API credentials.")
-        return
+        # Kontrollert feil: ikke-null avslutningskode (meldingen gaar til stderr via logging).
+        raise SystemExit(1)
     
     # Run the server
     mcp.run(transport='stdio')

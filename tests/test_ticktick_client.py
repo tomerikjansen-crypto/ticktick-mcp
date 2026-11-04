@@ -283,30 +283,17 @@ class TestRefreshTokenNullAutoritativ(unittest.TestCase):
         self.assertEqual(klient.access_token, "TEST-ny-i-minnet")
         self.assertEqual(klient.refresh_token, "TEST-rotert-refresh")
 
-    def test_lagring_til_env_gjor_ikke_null_til_streng(self):
-        klient = _lag_klient_direkte()
-        with i_tom_mappe() as ws:
-            klient._save_tokens_to_env({"access_token": "TEST-a", "refresh_token": None})
-            innhold = (Path(ws) / ".env").read_text(encoding="utf-8")
-        self.assertNotIn("None", innhold)
-        self.assertNotIn("TICKTICK_REFRESH_TOKEN", innhold)
-
-    def test_lagring_til_env_beholder_eksisterende_refresh_ved_null_og_tom(self):
-        klient = _lag_klient_direkte()
-        for svar in (None, ""):
-            with self.subTest(refresh=svar), i_tom_mappe() as ws:
-                (Path(ws) / ".env").write_text("TICKTICK_REFRESH_TOKEN=TEST-eksisterende\n",
-                                               encoding="utf-8")
-                klient._save_tokens_to_env({"access_token": "TEST-a", "refresh_token": svar})
-                innhold = (Path(ws) / ".env").read_text(encoding="utf-8")
-                self.assertIn("TICKTICK_REFRESH_TOKEN=TEST-eksisterende\n", innhold)
+    def test_klienten_har_ingen_env_skriving_av_tokens(self):
+        """Steg 13: .env-skrivingen er fjernet (tokenparet bor bare i tokens.json)."""
+        from ticktick_mcp.src.ticktick_client import TickTickClient
+        self.assertFalse(hasattr(TickTickClient, "_save_tokens_to_env"))
 
 
 class TestRefreshGrenenFaktisk(unittest.TestCase):
     """Kjoerer den FAKTISKE _refresh_access_token med simulert HTTP-svar.
 
     requests.post er mocket (ingen nett), TOKEN_FILE peker til en tmp-fil og
-    cwd er en tom tmp-mappe (.env skrives relativt). Kun TEST-verdier.
+    cwd er en tom tmp-mappe (en .env skal ikke oppstaa). Kun TEST-verdier.
     Kontrollerer minne, delt tokenfil og en ny klientoppstart.
     """
 
@@ -349,16 +336,13 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
     def _fil(self):
         return json.loads(self.fil.read_text(encoding="utf-8"))
 
-    def _env_fil(self):
-        return (Path(self.mappe) / ".env").read_text(encoding="utf-8")
-
     def _sjekk_gammel_refresh_beholdt(self, klient):
         """Et OAuth-svar uten faktisk ny refresh-token betyr "ikke rotert": behold den gamle."""
         self.assertEqual(klient.access_token, "TEST-access-ny")
         self.assertEqual(klient.refresh_token, "TEST-refresh-gammel", "minne")
         self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-gammel", "delt tokenfil")
         self.assertEqual(self._fil()["access_token"], "TEST-access-ny")
-        self.assertNotIn("None", self._env_fil())
+        self.assertFalse((Path(self.mappe) / ".env").exists(), "fornyelse lager ingen .env")
         self.assertEqual(self._ny_klient().refresh_token, "TEST-refresh-gammel", "ny oppstart")
 
     def test_refresh_svar_med_null_beholder_gammel_verdi(self):
@@ -434,22 +418,22 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self._ny_klient()
 
-    def test_env_skrivefeil_hindrer_ikke_tokenfila_eller_tidsstempel(self):
-        """Astra 2 / CR 1: tokenfila skrives FOERST, og en feil i .env svelges verdifritt."""
-        (Path(self.mappe) / ".env").mkdir()  # .env som mappe gir ekte OSError ved lesing/skriving
+    def test_fornyelse_roerer_ikke_env(self):
+        """Steg 13: fornyelsen skriver bare tokenfila og berører aldri .env (her en mappe)."""
+        (Path(self.mappe) / ".env").mkdir()  # ville gitt OSError ved enhver lesing/skriving
         klient = self._ny_klient()
         respons = MagicMock()
         respons.raise_for_status.return_value = None
         respons.json.return_value = {"access_token": "TEST-access-ny",
                                      "refresh_token": "TEST-refresh-rotert"}
         with patch("ticktick_mcp.src.ticktick_client.requests.post", return_value=respons), \
-                self.assertLogs("ticktick_mcp.src.ticktick_client", level="WARNING") as logg:
+                self.assertNoLogs("ticktick_mcp.src.ticktick_client", level="WARNING"):
             self.assertTrue(klient._refresh_access_token())
         self.assertEqual(self._fil()["refresh_token"], "TEST-refresh-rotert")
         self.assertEqual(self._fil()["access_token"], "TEST-access-ny")
         self.assertEqual(klient._fil_mtime_ns, self.fil.stat().st_mtime_ns)
         self.assertEqual(klient.refresh_token, "TEST-refresh-rotert")
-        self.assertNotIn("TEST-", "\n".join(logg.output), "ingen tokenverdier i loggen")
+        self.assertEqual(list((Path(self.mappe) / ".env").iterdir()), [])
 
     def test_ikke_streng_access_token_i_fil_ignoreres(self):
         """CR 6: access_token maa vaere en ikke-tom streng."""
@@ -499,8 +483,9 @@ class TestRefreshGrenenFaktisk(unittest.TestCase):
 
 
 class TestAuthSkriverTokenfilOgEnv(unittest.TestCase):
-    """authenticate/auth.py skal skrive .env uten "None" OG den delte tokenfila
-    (som vinner ved oppstart), i samme format som klienten. Kun TEST-verdier."""
+    """authenticate/auth.py skal skrive tokenparet bare til den delte tokenfila
+    (som vinner ved oppstart), i samme format som klienten, og aldri til .env.
+    Kun TEST-verdier."""
 
     def _lagre(self, tokens, eksisterende_env=None):
         from ticktick_mcp.src.auth import TickTickAuth
@@ -513,16 +498,18 @@ class TestAuthSkriverTokenfilOgEnv(unittest.TestCase):
             auth = TickTickAuth(client_id="TEST-cid", client_secret="TEST-csecret")
             auth.tokens = tokens
             with patch("ticktick_mcp.src.ticktick_client.TOKEN_FILE", fil):
-                auth._save_tokens_to_env()
+                auth._save_tokens()
             env = (Path(mappe) / ".env").read_text(encoding="utf-8")
             data = json.loads(fil.read_text(encoding="utf-8")) if fil.exists() else None
         return env, data
 
-    def test_null_refresh_gir_ikke_none_i_env_og_null_i_tokenfil(self):
+    def test_null_refresh_gir_null_i_tokenfil_og_ingen_tokenlinjer_i_env(self):
         env, data = self._lagre({"access_token": "TEST-a", "refresh_token": None},
                                 "TICKTICK_REFRESH_TOKEN=TEST-gammel\n")
         self.assertNotIn("None", env)
-        self.assertIn("TICKTICK_REFRESH_TOKEN=\n", env)
+        self.assertNotIn("TEST-a\n", env)
+        # Den gamle linjen fjernes ikke her (fase B), men endres heller ikke.
+        self.assertIn("TICKTICK_REFRESH_TOKEN=TEST-gammel\n", env)
         self.assertEqual(data["access_token"], "TEST-a")
         self.assertIsNone(data["refresh_token"])
         self.assertEqual(data["kilde"], "python-auth")
@@ -534,9 +521,11 @@ class TestAuthSkriverTokenfilOgEnv(unittest.TestCase):
         self.assertNotIn("None", env)
         self.assertIsNone(data["refresh_token"])
 
-    def test_refresh_streng_skrives_begge_steder(self):
+    def test_refresh_streng_skrives_bare_til_tokenfila(self):
         env, data = self._lagre({"access_token": "TEST-a", "refresh_token": "TEST-r"})
-        self.assertIn("TICKTICK_REFRESH_TOKEN=TEST-r\n", env)
+        self.assertNotIn("TEST-r", env)
+        self.assertNotIn("TICKTICK_ACCESS_TOKEN", env)
+        self.assertIn("TICKTICK_CLIENT_ID=TEST-cid\n", env)
         self.assertEqual(data["refresh_token"], "TEST-r")
 
     def test_ny_innlogging_via_auth_faar_effekt_ved_klientoppstart(self):
@@ -761,9 +750,9 @@ class TestAuthFeilveier(unittest.TestCase):
         auth.tokens = {"access_token": "TEST-a"}
         with patch("ticktick_mcp.src.auth.skriv_token_fil",
                    side_effect=lambda *a, **k: rekkefolge.append("fil") or True), \
-                patch.object(TickTickAuth, "_skriv_env",
+                patch.object(TickTickAuth, "_skriv_klient_env",
                              side_effect=lambda *a, **k: rekkefolge.append("env")):
-            auth._save_tokens_to_env()
+            auth._save_tokens()
         self.assertEqual(rekkefolge, ["fil", "env"])
 
 
