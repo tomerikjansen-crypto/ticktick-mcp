@@ -19,6 +19,7 @@ env/
 .mcp.json
 settings.local.json
 client_secret_*.json
+*.tmp
 
 # IDE specific files
 .idea/
